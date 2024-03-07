@@ -15,7 +15,7 @@ from logging.handlers import TimedRotatingFileHandler
 from prawcore.exceptions import ResponseException
 from prawcore.exceptions import NotFound
 
-debugmode = True
+debugmode = False
 verbosemode = False
 
 logs_dir = "logs/"
@@ -73,7 +73,7 @@ def fetch_and_cache_configs(max_retries=2, retry_delay=5, single_sub=None):
                 wiki_content = wiki_page.content_md.strip()
 
                 if not wiki_content:
-                    print(f"Flair Helper configuration for r/{subreddit_name} is blank. Skipping...") if debugmode else None
+                    print(f"Flair Helper wiki page configuration for r/{subreddit_name} is blank. Skipping...") if debugmode else None
                     break  # Skip processing if the wiki page is blank
 
                 try:
@@ -124,7 +124,7 @@ def fetch_and_cache_configs(max_retries=2, retry_delay=5, single_sub=None):
                         print(f"The Flair Helper wiki page configuration for r/{subreddit_name} has not changed.") if debugmode else None
                     break  # Configuration loaded successfully, exit the retry loop
                 except (prawcore.exceptions.ResponseException, prawcore.exceptions.RequestException) as e:
-                    error_output = f"Error loading configuration for r/{subreddit_name}: {str(e)}"
+                    error_output = f"Error loading wiki page configuration for r/{subreddit_name}: {str(e)}"
                     print(error_output) if debugmode else None
                     errors_logger.error(error_output)
                     retries += 1
