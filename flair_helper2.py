@@ -326,7 +326,9 @@ def process_flair_assignment(log_entry, config, subreddit):
                 formatted_footer = "\n\n" + formatted_footer
 
             if require_config_to_edit and not log_entry.mod.has_permission('config'):
-                print(f"Mod {log_entry.mod.name} does not have permission to edit config") if debugmode else None
+                error_output = f"Mod {log_entry.mod.name} does not have permission to edit config"
+                print(error_output) if debugmode else None
+                errors_logger.error(error_output)
                 return
 
             last_flair_time = getattr(post, '_last_flair_time', 0)
@@ -432,99 +434,98 @@ def handle_private_messages():
     for message in reddit.inbox.unread(limit=None):
         if isinstance(message, praw.models.Message):
             subject = message.subject.lower()
-            subreddit_name = message.body.strip()
+            body = message.body.strip()
+            subreddit_name = body.split()[0]
+            use_rules = len(body.split()) > 1 and body.split()[1].lower() == 'rules'
 
             print(f"PM Received") if debugmode else None
 
-            if subject == 'list':
-                print(f"'list' PM Received") if debugmode else None
+            if not re.match(r'^[a-zA-Z0-9_]{3,21}$', subreddit_name):
+                response = "Invalid subreddit name. The subreddit name must be between 3 and 21 characters long and can only contain letters, numbers, and underscores."
+            else:
                 try:
                     subreddit = reddit.subreddit(subreddit_name)
-                    if subreddit.user_is_moderator:
-                        mod_flair_templates = [
-                            f"{template['text']}: {template['id']}"
-                            for template in subreddit.flair.link_templates
-                            if template['mod_only']
-                        ]
-                        if mod_flair_templates:
-                            response = "Mod-only flair templates:\n\n" + "\n\n".join(mod_flair_templates)
-                        else:
-                            response = "No mod-only flair templates found for r/{}.".format(subreddit_name)
-                    else:
-                        response = "You are not a moderator of r/{}.".format(subreddit_name)
-                except prawcore.exceptions.NotFound:
-                    response = "Subreddit r/{} not found.".format(subreddit_name)
-
-            elif subject == 'auto':
-                print(f"'auto' PM Received") if debugmode else None
-                try:
-                    subreddit = reddit.subreddit(subreddit_name)
-                    if subreddit.user_is_moderator:
-                        use_rules = 'rules' in subreddit_name.lower()
-
-                        if use_rules:
-                            rules = list(subreddit.rules)
-                            flair_templates = []
-                            for rule in rules:
-                                flair_templates.append({
-                                    'text': rule.short_name,
-                                    'id': rule.violation_reason
-                                })
-                        else:
-                            flair_templates = [
-                                template for template in subreddit.flair.link_templates
+                    if subject == 'list':
+                        print(f"'list' PM Received") if debugmode else None
+                        if subreddit.user_is_moderator:
+                            mod_flair_templates = [
+                                f"{template['text']}: {template['id']}"
+                                for template in subreddit.flair.link_templates
                                 if template['mod_only']
                             ]
+                            if mod_flair_templates:
+                                response = "Mod-only flair templates:\n\n" + "\n\n".join(mod_flair_templates)
+                            else:
+                                response = "No mod-only flair templates found for r/{}.".format(subreddit_name)
+                        else:
+                            response = "You are not a moderator of r/{}.".format(subreddit_name)
 
-                        config = {
-                            'header': "Hi /u/{{author}}, thanks for contributing to /r/{{subreddit}}. Unfortunately, your post was removed as it violates our rules:",
-                            'footer': "Please read the sidebar and the rules of our subreddit [here](https://www.reddit.com/r/{{subreddit}}/about/rules) before posting again. If you have any questions or concerns please [message the moderators through modmail](https://www.reddit.com/message/compose?to=/r/{{subreddit}}&subject=About my removed {{kind}}&message=I'm writing to you about the following {{kind}}: {{url}}. %0D%0DMy issue is...).",
-                            'flairs': {},
-                            'comment': {},
-                            'removal_comment_type': 'public_as_subreddit',
-                            'remove': {},
-                            'lock_post': {},
-                            'spoiler_post': {},
-                            'set_author_flair_text': {},
-                            'set_author_flair_css_class': {},
-                            'usernote': {},
-                            'usernote_type_name': 'flair_helper_note',
-                            'webhook': '',
-                            'send_to_webhook': [],
-                            'wh_content': '',
-                            'wh_ping_over_score': None,
-                            'wh_ping_over_ping': '',
-                            'wh_exclude_mod': False,
-                            'wh_exclude_reports': False,
-                            'wh_exclude_image': False,
-                            'wh_include_nsfw_images': False
-                        }
+                    elif subject == 'auto':
+                        try:
+                            print(f"'auto' PM Received") if debugmode else None
+                            if subreddit.user_is_moderator:
+                                use_rules = body.split()[1].lower() == 'rules' if len(body.split()) > 1 else False
 
-                        for template in flair_templates:
-                            flair_id = template['id']
-                            flair_text = template['text']
+                                if use_rules:
+                                    rules = list(subreddit.rules)
+                                    flair_templates = []
+                                    for rule in rules:
+                                        flair_templates.append({
+                                            'text': rule.short_name,
+                                            'id': rule.violation_reason
+                                        })
+                                else:
+                                    flair_templates = list(subreddit.flair.link_templates)
 
-                            config['flairs'][flair_id] = f"This is the removal reason for Flair '{flair_text}'"
-                            config['comment'][flair_id] = True
-                            config['remove'][flair_id] = False
-                            config['lock_post'][flair_id] = False
-                            config['spoiler_post'][flair_id] = False
-                            config['set_author_flair_text'][flair_id] = f"Removed: {flair_text}"
-                            config['set_author_flair_css_class'][flair_id] = "removed"
-                            config['usernote'][flair_id] = f"Post removed for violating rule: {flair_text}"
+                                config = {
+                                    'header': "Hi /u/{{author}}, thanks for contributing to /r/{{subreddit}}. Unfortunately, your post was removed as it violates our rules:",
+                                    'footer': "Please read the sidebar and the rules of our subreddit [here](https://www.reddit.com/r/{{subreddit}}/about/rules) before posting again. If you have any questions or concerns please [message the moderators through modmail](https://www.reddit.com/message/compose?to=/r/{{subreddit}}&subject=About my removed {{kind}}&message=I'm writing to you about the following {{kind}}: {{url}}. %0D%0DMy issue is...).",
+                                    'flairs': {},
+                                    'remove': {},
+                                    'lock_post': {},
+                                    'comment': {},
+                                    'removal_comment_type': 'public_as_subreddit',
+                                    'usernote': {},
+                                    'usernote_type_name': 'flair_helper_note'
+                                }
 
-                        response = "Here's a sample Flair Helper 2 configuration for your subreddit.\n\nBe sure to click the 'source' button below the message so you can copy the config correctly.\n\nOnly copy the code between the triple \`\`\`'s:\n\n"
-                        response += "```\n" + yaml.dump(config, sort_keys=False) + "```"
+                                for template in flair_templates:
+                                    flair_id = template['id']
+                                    flair_text = template['text']
+                                    config['flairs'][flair_id] = f"Removal violation: {flair_text}"
+
+                                # Limit the number of flairs used in remove, lock_post, comment, and usernote sections
+                                limited_flairs = flair_templates[:4]
+
+                                for template in limited_flairs:
+                                    flair_id = template['id']
+                                    flair_text = template['text']
+                                    config['remove'][flair_id] = True
+                                    config['lock_post'][flair_id] = True
+                                    config['comment'][flair_id] = True
+                                    config['usernote'][flair_id] = f"Post violated rule: {flair_text}"
+
+                                yaml_output = yaml.dump(config, sort_keys=False)
+                                formatted_yaml_output = "    " + yaml_output.replace("\n", "\n    ")
+
+                                response = "Here's a sample Flair Helper 2 configuration for your subreddit:\n\n"
+                                response += formatted_yaml_output
+                                print(f"\n\nFormatted Yaml Output Message:\n\n{response}") if debugmode else None
+                            else:
+                                response = "You are not a moderator of r/{}.".format(subreddit_name)
                     else:
-                        response = "You are not a moderator of r/{}.".format(subreddit_name)
+                        response = "Unknown command. Available commands: 'list', 'auto'."
+
                 except prawcore.exceptions.NotFound:
                     response = "Subreddit r/{} not found.".format(subreddit_name)
 
-            else:
-                response = "Unknown command. Available commands: 'list', 'auto'."
-
             message.mark_read()
-            message.reply(response)
+            try:
+                message.reply(response)
+            except Exception as e:
+                error_output = f"Error replying to message: {str(e)}"
+                print(error_output) if debugmode else None
+                errors_logger.error(error_output)
 
 
 
@@ -548,12 +549,12 @@ def monitor_mod_log(subreddit, config):
                         error_output = f"Flair Helper wiki page not found in r/{subreddit.display_name}"
                         print(error_output) if debugmode else None
                         errors_logger.error(error_output)
-                #else:
-                    #print(f"Ignoring wiki revision: {log_entry.details} in r/{subreddit.display_name}") if debugmode else None
             else:
                 print(f"Ignoring action: {log_entry.action} in r/{subreddit.display_name}") if verbosemode else None
     except prawcore.exceptions.ResponseException as e:
-        print(f"Error: {e}") if debugmode else None
+        error_output = f"Error: {e}"
+        print(error_output) if debugmode else None
+        errors_logger.error(error_output)
 
 
 
