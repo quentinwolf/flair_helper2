@@ -14,6 +14,7 @@ import concurrent.futures
 from logging.handlers import TimedRotatingFileHandler
 from prawcore.exceptions import ResponseException
 from prawcore.exceptions import NotFound
+from discord_webhook import DiscordWebhook, DiscordEmbed
 
 debugmode = False
 verbosemode = False
@@ -73,7 +74,7 @@ def fetch_and_cache_configs(max_retries=2, retry_delay=5, single_sub=None):
                 wiki_content = wiki_page.content_md.strip()
 
                 if not wiki_content:
-                    print(f"Flair Helper wiki page configuration for r/{subreddit_name} is blank. Skipping...") if debugmode else None
+                    print(f"Flair Helper configuration for r/{subreddit_name} is blank. Skipping...") if debugmode else None
                     break  # Skip processing if the wiki page is blank
 
                 try:
@@ -124,7 +125,7 @@ def fetch_and_cache_configs(max_retries=2, retry_delay=5, single_sub=None):
                         print(f"The Flair Helper wiki page configuration for r/{subreddit_name} has not changed.") if debugmode else None
                     break  # Configuration loaded successfully, exit the retry loop
                 except (prawcore.exceptions.ResponseException, prawcore.exceptions.RequestException) as e:
-                    error_output = f"Error loading wiki page configuration for r/{subreddit_name}: {str(e)}"
+                    error_output = f"Error loading configuration for r/{subreddit_name}: {str(e)}"
                     print(error_output) if debugmode else None
                     errors_logger.error(error_output)
                     retries += 1
@@ -210,6 +211,52 @@ def add_usernote(notes, author, note_text, link, mod_index):
         "w": 0
     }
     notes[author]["ns"].append(new_note)
+
+def send_webhook_notification(config, post, flair_text, mod_name, flair_guid):
+    print(f"Sending webhook notification for flair GUID: {flair_guid}") if debugmode else None
+    if 'webhook' in config and flair_guid in config['send_to_webhook']:
+        print(f"Webhook notification triggered for flair GUID: {flair_guid}") if debugmode else None
+
+        webhook_url = config['webhook']
+        webhook = DiscordWebhook(url=webhook_url)
+
+        # Create the embed
+        embed = DiscordEmbed(title=f"Post Actioned: {post.title}", description=post.url, color=242424)
+        embed.set_author(name=post.author.name)
+        embed.add_embed_field(name="Flair", value=flair_text)
+        embed.add_embed_field(name="Subreddit", value=post.subreddit.display_name)
+
+        if not config.get('wh_exclude_mod', False):
+            embed.add_embed_field(name="Actioned By", value=mod_name)
+
+        if not config.get('wh_exclude_reports', False):
+            reports = ", ".join(post.mod_reports)
+            embed.add_embed_field(name="Reports", value=reports)
+
+        if post.over_18 and not config.get('wh_include_nsfw_images', False):
+            pass  # Exclude NSFW images unless explicitly included
+        elif not config.get('wh_exclude_image', False):
+            embed.set_image(url=post.url)
+
+        # Add the embed to the webhook
+        webhook.add_embed(embed)
+
+        # Set the content if provided
+        if 'wh_content' in config:
+            webhook.set_content(config['wh_content'])
+
+        # Send a ping if the score exceeds the specified threshold
+        if 'wh_ping_over_score' in config and 'wh_ping_over_ping' in config:
+            if post.score >= config['wh_ping_over_score']:
+                if config['wh_ping_over_ping'] == 'everyone':
+                    webhook.set_content("@everyone")
+                elif config['wh_ping_over_ping'] == 'here':
+                    webhook.set_content("@here")
+                else:
+                    webhook.set_content(f"<@&{config['wh_ping_over_ping']}>")
+
+        # Send the webhook
+        response = webhook.execute()
 
 # Primary process to handle any flair changes that appear in the logs
 def process_flair_assignment(log_entry, config, subreddit):
@@ -376,6 +423,8 @@ def process_flair_assignment(log_entry, config, subreddit):
                 print(f"remove_contributor triggered in r/{subreddit.display_name}") if debugmode else None
                 subreddit.contributor.remove(post.author)
 
+            # Send webhook notification
+            send_webhook_notification(config, post, flair_text, log_entry.mod.name, flair_guid)
 
 
 # Handle Private Messages to allow the bot to reply back with a list of flairs for convenience
@@ -439,7 +488,16 @@ def handle_private_messages():
                             'set_author_flair_text': {},
                             'set_author_flair_css_class': {},
                             'usernote': {},
-                            'usernote_type_name': 'flair_helper_note'
+                            'usernote_type_name': 'flair_helper_note',
+                            'webhook': '',
+                            'send_to_webhook': [],
+                            'wh_content': '',
+                            'wh_ping_over_score': None,
+                            'wh_ping_over_ping': '',
+                            'wh_exclude_mod': False,
+                            'wh_exclude_reports': False,
+                            'wh_exclude_image': False,
+                            'wh_include_nsfw_images': False
                         }
 
                         for template in flair_templates:
@@ -496,6 +554,8 @@ def monitor_mod_log(subreddit, config):
                 print(f"Ignoring action: {log_entry.action} in r/{subreddit.display_name}") if verbosemode else None
     except prawcore.exceptions.ResponseException as e:
         print(f"Error: {e}") if debugmode else None
+
+
 
 # Create Multithreaded Instance to monitor all subs that have a valid Flair_Helper configuration
 def run_bot():
