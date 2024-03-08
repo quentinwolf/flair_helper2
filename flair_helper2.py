@@ -513,6 +513,9 @@ def handle_private_messages():
                                 print(f"\n\nFormatted Yaml Output Message:\n\n{response}") if debugmode else None
                             else:
                                 response = "You are not a moderator of r/{}.".format(subreddit_name)
+                        except prawcore.exceptions.NotFound:
+                            response = "Subreddit r/{} not found.".format(subreddit_name)
+
                     else:
                         response = "Unknown command. Available commands: 'list', 'auto'."
 
