@@ -221,13 +221,15 @@ def send_webhook_notification(config, post, flair_text, mod_name, flair_guid):
         webhook = DiscordWebhook(url=webhook_url)
 
         # Create the embed
-        embed = DiscordEmbed(title=f"Post Actioned: {post.title}", description=post.url, color=242424)
-        embed.set_author(name=post.author.name)
-        embed.add_embed_field(name="Flair", value=flair_text)
-        embed.add_embed_field(name="Subreddit", value=post.subreddit.display_name)
+        embed = DiscordEmbed(title=f"{post.title}", url="https://www.reddit.com"+post.permalink, description=post.link_flair_text, color=242424)
+        embed.add_embed_field(name="Author", value=post.author.name)
+        embed.add_embed_field(name="Score", value=post.score)
+        embed.add_embed_field(name="Created", value=datetime.utcfromtimestamp(post.created_utc).strftime('%b %u %Y %H:%M:%S UTC'))
+        embed.add_embed_field(name="User Flair", value=flair_text)
+        embed.add_embed_field(name="Subreddit", value="/r/"+post.subreddit.display_name)
 
         if not config.get('wh_exclude_mod', False):
-            embed.add_embed_field(name="Actioned By", value=mod_name)
+            embed.add_embed_field(name="Actioned By", value=mod_name, inline=False)
 
         if not config.get('wh_exclude_reports', False):
             reports = ", ".join(post.mod_reports)
