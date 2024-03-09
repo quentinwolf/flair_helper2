@@ -5,7 +5,7 @@ Flair Helper 2 is an enhanced version of the original Flair Helper bot for Reddi
 ## Features
 
 - Automatically applies predefined actions based on link flair assignments
-- Supports various actions such as banning, post removal, commenting, locking, spoilering, and more
+- Supports various actions such as banning, unbanning (NEW!), post removal, post approval (automatically unlocks and unspoilers), commenting, locking, spoilering (NEW!), adding usernotes, discord webhooks and more
 - Allows customization of removal reasons, comments, and ban messages using placeholders
 - Integrates with Toolbox usernotes for enhanced moderation
 - Anonymizes removal comments by default using the subreddit's ModTeam account
