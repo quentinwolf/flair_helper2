@@ -1,4 +1,0 @@
-praw
-prawcore
-PyYAML
-discord-webhook
