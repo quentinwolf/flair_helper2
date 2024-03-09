@@ -47,12 +47,14 @@ Replace `YOUR_CLIENT_ID`, `YOUR_CLIENT_SECRET`, `YOUR_REFRESH_TOKEN`, and `YOUR_
 
 6. Run the bot:
 ```
-python flair_helper2.py
+python flair_helper2_async.py
 ```
+
+I initially started off with a non-async version, although found I'd occasionally run into some oddities, so I began converting it over to an asynchronous version.  The old one has mostly been updated with all the same features, although could use further development.
 
 ## Contributing
 
-Contributions to Flair Helper 2 are welcome! If you have any ideas, suggestions, or bug reports, please open an issue on the GitHub repository. If you'd like to contribute code improvements, feel free to submit a pull request.
+Contributions to Flair Helper 2 are welcome! If you have any ideas, suggestions, or bug reports, please open an issue on the GitHub repository.  If you'd like to contribute code improvements, feel free to submit a pull request.
 
 ## License
 
