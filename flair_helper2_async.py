@@ -61,7 +61,7 @@ def get_cached_config(subreddit_name):
     result = c.fetchone()
     conn.close()
     if result:
-        return yaml.load(result[0], Loader=yaml.FullLoader)
+        return yaml.safe_load(result[0])  # Use yaml.safe_load instead of yaml.load
     return None
 
 
@@ -83,9 +83,9 @@ async def check_mod_permissions(subreddit, mod_name):
     for moderator in moderators:
         if moderator.name == mod_name:
             mod_permissions = set(moderator.mod_permissions)
-            #print(f"Debugging: Mod {mod_name} has the following permissions in r/{subreddit.display_name}: {mod_permissions}") if debugmode else None
+            #print(f"Debugging: Mod {mod_name} has the following permissions in /r/{subreddit.display_name}: {mod_permissions}") if debugmode else None
             return mod_permissions
-    #print(f"Debugging: Mod {mod_name} is not a moderator of r/{subreddit.display_name}") if debugmode else None
+    #print(f"Debugging: Mod {mod_name} is not a moderator of /r/{subreddit.display_name}") if debugmode else None
     return None
 
 
@@ -105,7 +105,7 @@ async def fetch_and_cache_configs(reddit, max_retries=2, retry_delay=5, single_s
     for subreddit in moderated_subreddits:
         subreddit_name = subreddit.display_name
         if f"u_{bot_username}" in subreddit_name:
-            print(f"Skipping bot's own user page: r/{subreddit_name}") if debugmode else None
+            print(f"Skipping bot's own user page: /r/{subreddit_name}") if debugmode else None
             continue  # Skip the bot's own user page
 
         retries = 0
@@ -121,7 +121,7 @@ async def fetch_and_cache_configs(reddit, max_retries=2, retry_delay=5, single_s
                     print(f"Error accessing wiki page: {e}")
 
                 if not wiki_content:
-                    print(f"Flair Helper configuration for r/{subreddit_name} is blank. Skipping...") if debugmode else None
+                    print(f"Flair Helper configuration for /r/{subreddit_name} is blank. Skipping...") if debugmode else None
                     break  # Skip processing if the wiki page is blank
 
                 try:
@@ -140,7 +140,7 @@ async def fetch_and_cache_configs(reddit, max_retries=2, retry_delay=5, single_s
                                 pass
                             else:
                                 # The moderator does not have the 'config' permission or is not a moderator
-                                error_output = f"Mod {mod_name} does not have permission to edit config in r/{subreddit_name}"
+                                error_output = f"Mod {mod_name} does not have permission to edit config in /r/{subreddit_name}"
                                 print(error_output) if debugmode else None
                                 errors_logger.error(error_output)
                                 break  # Skip reloading the configuration and continue with the next subreddit
@@ -148,38 +148,38 @@ async def fetch_and_cache_configs(reddit, max_retries=2, retry_delay=5, single_s
                         try:
                             yaml.load(wiki_content, Loader=yaml.FullLoader)
                             await cache_config(subreddit_name, updated_config)
-                            print(f"The Flair Helper wiki page configuration for r/{subreddit_name} has been successfully reloaded.") if debugmode else None
+                            print(f"The Flair Helper wiki page configuration for /r/{subreddit_name} has been successfully reloaded.") if debugmode else None
                             try:
                                 subreddit_instance = await reddit.subreddit(subreddit_name)
                                 await subreddit_instance.modmail.create(
                                     subject="Flair Helper Configuration Reloaded",
-                                    body=f"The Flair Helper configuration for r/{subreddit_name} has been successfully reloaded.",
+                                    body=f"The Flair Helper configuration for /r/{subreddit_name} has been successfully reloaded.",
                                     recipient=subreddit_name  # Ensure recipient is correctly specified, might need adjustment
                                 )
                             except asyncpraw.exceptions.RedditAPIException as e:
-                                error_output = f"Error sending modmail to r/{subreddit_name}: {str(e)}"
+                                error_output = f"Error sending modmail to /r/{subreddit_name}: {e}"
                                 print(error_output) if debugmode else None
                                 errors_logger.error(error_output)
                         except yaml.YAMLError as e:
-                            error_output = f"Error parsing YAML configuration for r/{subreddit_name}: {str(e)}"
+                            error_output = f"Error parsing YAML configuration for /r/{subreddit_name}: {e}"
                             print(error_output) if debugmode else None
                             errors_logger.error(error_output)
                             try:
                                 subreddit_instance = await reddit.subreddit(subreddit_name)
                                 await subreddit_instance.modmail.create(
                                     subject="Flair Helper Configuration Error",
-                                    body="The Flair Helper configuration for r/{} could not be reloaded due to YAML parsing errors:\n\n{}".format(subreddit_name, str(e)),
+                                    body=f"The Flair Helper configuration for /r/{subreddit_name} could not be reloaded due to YAML parsing errors:\n\n{e}",
                                     recipient=subreddit_name
                                 )
                             except asyncpraw.exceptions.RedditAPIException as e:
-                                error_output = f"Error sending modmail to r/{subreddit_name}: {str(e)}"
+                                error_output = f"Error sending modmail to /r/{subreddit_name}: {e}"
                                 print(error_output) if debugmode else None
                                 errors_logger.error(error_output)
                     else:
-                        print(f"The Flair Helper wiki page configuration for r/{subreddit_name} has not changed.") if debugmode else None
+                        print(f"The Flair Helper wiki page configuration for /r/{subreddit_name} has not changed.") if debugmode else None
                     break  # Configuration loaded successfully, exit the retry loop
                 except (asyncprawcore.exceptions.ResponseException, asyncprawcore.exceptions.RequestException) as e:
-                    error_output = f"Error loading configuration for r/{subreddit_name}: {str(e)}"
+                    error_output = f"Error loading configuration for /r/{subreddit_name}: {e}"
                     print(error_output) if debugmode else None
                     errors_logger.error(error_output)
                     retries += 1
@@ -187,25 +187,25 @@ async def fetch_and_cache_configs(reddit, max_retries=2, retry_delay=5, single_s
                         print(f"Retrying in {retry_delay} seconds...") if debugmode else None
                         time.sleep(retry_delay)
                     else:
-                        print(f"Max retries exceeded for r/{subreddit_name}. Skipping...") if debugmode else None
+                        print(f"Max retries exceeded for /r/{subreddit_name}. Skipping...") if debugmode else None
             except asyncprawcore.exceptions.Forbidden:
-                error_output = f"Error: Bot does not have permission to access the wiki page in r/{subreddit_name}"
+                error_output = f"Error: Bot does not have permission to access the wiki page in /r/{subreddit_name}"
                 print(error_output) if debugmode else None
                 errors_logger.error(error_output)
                 break  # Skip retrying if the bot doesn't have permission
             except asyncprawcore.exceptions.NotFound:
-                error_output = f"Flair Helper wiki page doesn't exist for r/{subreddit_name}"
+                error_output = f"Flair Helper wiki page doesn't exist for /r/{subreddit_name}"
                 print(error_output) if debugmode else None
                 errors_logger.error(error_output)
                 try:
                     subreddit_instance = await reddit.subreddit(subreddit_name)
                     await subreddit_instance.modmail.create(
                         subject="Flair Helper Wiki Page Not Found",
-                        body="The Flair Helper wiki page doesn't exist for r/{}. Please go to https://www.reddit.com/r/{}/wiki/flair_helper and create the page to add this subreddit.".format(subreddit_name, subreddit_name),
+                        body=f"The Flair Helper wiki page doesn't exist for /r/{subreddit_name}. Please go to https://www.reddit.com/r/{subreddit_name}/wiki/flair_helper and create the page to add this subreddit.",
                         recipient=subreddit_name
                     )
                 except asyncpraw.exceptions.RedditAPIException as e:
-                    error_output = f"Error sending modmail to r/{subreddit_name}: {str(e)}"
+                    error_output = f"Error sending modmail to /r/{subreddit_name}: {e}"
                     print(error_output) if debugmode else None
                     errors_logger.error(error_output)
                 break  # Skip retrying if the wiki page doesn't exist
@@ -343,9 +343,11 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit):
     if target_fullname.startswith('t3_'):  # Check if it's a submission
         submission_id = target_fullname[3:]  # Remove the 't3_' prefix
         post = await reddit.submission(submission_id)
-        flair_guid = post.link_flair_template_id
+        flair_guid = getattr(post, 'link_flair_template_id', None)  # Use getattr to safely retrieve the attribute
         print(f"Flair GUID detected: {flair_guid}")
-        if flair_guid in config['flairs']:
+        # Reload the configuration from the database
+        config = get_cached_config(subreddit.display_name)
+        if flair_guid and flair_guid in config['flairs']:
 
             await post.load()
             # Now that post data is loaded, ensure that author data is loaded
@@ -362,6 +364,16 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit):
             else:
                 # Handle the case where the post may not have an author (e.g., deleted account)
                 subreddit_id = None
+
+            current_flair = await fetch_user_flair(subreddit, post.author.name)  # Fetch the current flair asynchronously
+
+            # Initialize defaults if the user has no current flair
+            flair_text = ''
+            flair_css_class = ''
+
+            if current_flair:
+                flair_text = current_flair.get('flair_text', '')
+                flair_css_class = current_flair.get('flair_css_class', '')
 
             # Retrieve the flair details from the configuration
             flair_details = config['flairs'][flair_guid]
@@ -441,89 +453,100 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit):
             removal_reason = f"{formatted_header}\n\n{formatted_flair_details}\n\n{formatted_footer}"
 
             # Execute the configured actions
-            if config['remove'].get(flair_guid, False):
-                print(f"remove triggered in r/{subreddit.display_name}") if debugmode else None
+            if 'approve' in config and config['approve'].get(flair_guid, False):
+                print(f"Approve triggered in /r/{subreddit.display_name}") if debugmode else None
+                print(f"Submission approved in /r/{subreddit.display_name}") if debugmode else None
+                await post.mod.approve()
+                print(f"Submission unlocked in /r/{subreddit.display_name}") if debugmode else None
+                await post.mod.unlock()
+                print(f"Spoiler removed in /r/{subreddit.display_name}") if debugmode else None
+                await post.mod.unspoiler()
+
+            if 'remove' in config and config['remove'].get(flair_guid, False):
+                print(f"remove triggered in /r/{subreddit.display_name}") if debugmode else None
                 mod_note = config['usernote'].get(flair_guid, '')
                 await post.mod.remove(spam=False, mod_note=mod_note)
 
-
-            post_age_days = (datetime.utcnow() - datetime.utcfromtimestamp(post.created_utc)).days
-
-            if config['comment'].get(flair_guid, False):
-                max_age = config.get('max_age_for_comment', 175)
+            if 'comment' in config and config['comment'].get(flair_guid, False):
+                post_age_days = (datetime.utcnow() - datetime.utcfromtimestamp(post.created_utc)).days
+                max_age = config.get('max_age_for_comment', 175) if 'max_age_for_comment' in config else 175
                 if isinstance(max_age, dict):
                     max_age = max_age.get(flair_guid, 175)
                 if post_age_days <= max_age:
-                    print(f"comment triggered in r/{subreddit.display_name}") if debugmode else None
-                    removal_type = config.get('removal_comment_type', 'public_as_subreddit')
-                    await post.mod.send_removal_message(message=removal_reason, type=removal_type)
+                    print(f"comment triggered in /r/{subreddit.display_name}") if debugmode else None
+
+                    if 'remove' in config and config['remove'].get(flair_guid, False):
+                        # If both 'remove' and 'comment' are configured for the flair GUID
+                        removal_type = config.get('removal_comment_type', 'public_as_subreddit') if 'removal_comment_type' in config else 'public_as_subreddit'
+
+                        print(f"Debugging: post_id={post.id}, removal_reason={removal_reason}, removal_type={removal_type}") if debugmode else None
+
+                        try:
+                            await post.mod.send_removal_message(message=removal_reason, type=removal_type)
+                        except asyncpraw.exceptions.RedditAPIException as e:
+                            print(f"Error sending removal message: {e}") if debugmode else None
+                    else:
+                        # If only 'comment' is configured for the flair GUID
+                        try:
+                            comment = await post.reply(removal_reason)
+                            if 'comment_stickied' in config and config['comment_stickied'].get(flair_guid, True):
+                                await comment.mod.distinguish(sticky=True)
+                            if 'comment_locked' in config and config['comment_locked'].get(flair_guid, True):
+                                await comment.mod.lock()
+                        except asyncpraw.exceptions.RedditAPIException as e:
+                            print(f"Error replying with comment: {e}") if debugmode else None
 
             # Check if banning is configured for the flair GUID
             if 'bans' in config and flair_guid in config['bans']:
                 ban_duration = config['bans'][flair_guid]
-                ban_message = config['ban_message'].get(flair_guid)
-                ban_note = config['ban_note'].get(flair_guid)
+                ban_message = config['ban_message'].get(flair_guid) if 'ban_message' in config else None
+                ban_note = config['ban_note'].get(flair_guid) if 'ban_note' in config else None
+
+                print(f"Debugging: ban_duration={ban_duration}, ban_message={ban_message}, ban_note={ban_note}") if debugmode else None
 
                 if ban_message:
                     for placeholder, value in placeholders.items():
                         ban_message = ban_message.replace(f"{{{{{placeholder}}}}}", str(value))
 
                 if ban_duration is True:
-                    print(f"permanent ban triggered in r/{subreddit.display_name}") if debugmode else None
+                    print(f"permanent ban triggered in /r/{subreddit.display_name}") if debugmode else None
                     await subreddit.banned.add(post.author, ban_message=ban_message, ban_reason=ban_note)
                 elif isinstance(ban_duration, int) and ban_duration > 0:
-                    print(f"temporary ban triggered for {ban_duration} days in r/{subreddit.display_name}") if debugmode else None
-                    await subreddit.banned.add(post.author, ban_message=ban_message, ban_reason=ban_note, duration=ban_duration)
+                    print(f"temporary ban triggered for {ban_duration} days in /r/{subreddit.display_name}") if debugmode else None
+                    try:
+                        await subreddit.banned.add(post.author, ban_message=ban_message, ban_reason=ban_note, duration=ban_duration)
+                    except Exception as e:
+                        print(f"Error banning user: {e}") if debugmode else None
                 else:
-                    print(f"banning not triggered for flair GUID: {flair_guid} in r/{subreddit.display_name}") if debugmode else None
+                    print(f"banning not triggered for flair GUID: {flair_guid} in /r/{subreddit.display_name}") if debugmode else None
 
+            if 'unbans' in config and flair_guid in config['unbans']:
+                print(f"unban triggered in /r/{subreddit.display_name}") if debugmode else None
+                try:
+                    await subreddit.banned.remove(post.author)
+                except Exception as e:
+                    print(f"Error unbanning user: {e}") if debugmode else None
 
-            if config['lock_post'].get(flair_guid, False):
-                print(f"lock triggered in r/{subreddit.display_name}") if debugmode else None
+            if 'lock_post' in config and config['lock_post'].get(flair_guid, False):
+                print(f"lock triggered in /r/{subreddit.display_name}") if debugmode else None
                 await post.mod.lock()
 
-            if config['spoiler_post'].get(flair_guid, False):
-                print(f"spoiler triggered in r/{subreddit.display_name}") if debugmode else None
-                max_retries = 2
-                retry_delay = 1  # Delay in seconds between retries
+            if 'spoiler_post' in config and config['spoiler_post'].get(flair_guid, False):
+                print(f"spoiler triggered in /r/{subreddit.display_name}") if debugmode else None
+                await post.mod.spoiler()
 
-                for attempt in range(max_retries):
-                    try:
-                        await post.mod.spoiler()
-                        print(f"Spoiler applied successfully after {attempt + 1} attempt(s)") if debugmode else None
-                        break  # Break out of the retry loop if the action succeeds
-                    except Exception as e:
-                        print(f"Error applying spoiler: {str(e)}. Retrying in {retry_delay} second(s)...") if debugmode else None
-                        await asyncio.sleep(retry_delay)  # Wait for the specified delay before retrying
-
-                else:
-                    # This block executes if the loop completes without breaking, indicating that all retries failed
-                    print(f"Failed to apply spoiler after {max_retries} attempts. Skipping...") if debugmode else None
-
-
-            if config['set_author_flair_text'].get(flair_guid) or config['set_author_flair_css_class'].get(flair_guid):
-                print(f"set_author_flair triggered in r/{subreddit.display_name}") if debugmode else None
-
-                current_flair = await fetch_user_flair(subreddit, post.author.name)  # Fetch the current flair asynchronously
-
-                # Initialize defaults if the user has no current flair
-                flair_text = ''
-                flair_css_class = ''
-
-                if current_flair:
-                    flair_text = current_flair.get('flair_text', '')
-                    flair_css_class = current_flair.get('flair_css_class', '')
+            if 'set_author_flair_text' in config and config['set_author_flair_text'].get(flair_guid) or 'set_author_flair_css_class' in config and config['set_author_flair_css_class'].get(flair_guid):
+                print(f"set_author_flair triggered in /r/{subreddit.display_name}") if debugmode else None
 
                 print(f"Current flair: text='{flair_text}', css_class='{flair_css_class}'") if debugmode else None
-
                 # Update the flair text based on the configuration
-                if config['set_author_flair_text'].get(flair_guid):
+                if 'set_author_flair_text' in config and config['set_author_flair_text'].get(flair_guid):
                     new_flair_text = config['set_author_flair_text'][flair_guid]
                     flair_text = new_flair_text.replace('{{author_flair_text}}', flair_text)
                     print(f"Updating flair text to: '{flair_text}'") if debugmode else None
 
                 # Update the flair CSS class based on the configuration
-                if config['set_author_flair_css_class'].get(flair_guid):
+                if 'set_author_flair_css_class' in config and config['set_author_flair_css_class'].get(flair_guid):
                     new_flair_css_class = config['set_author_flair_css_class'][flair_guid]
                     flair_css_class = new_flair_css_class.replace('{{author_flair_css_class}}', flair_css_class)
                     print(f"Updating flair CSS class to: '{flair_css_class}'") if debugmode else None
@@ -533,11 +556,10 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit):
                     await subreddit.flair.set(post.author.name, text=flair_text, css_class=flair_css_class)
                     print(f"Flair updated for user {post.author.name}: text='{flair_text}', css_class='{flair_css_class}'") if debugmode else None
                 except Exception as e:
-                    print(f"Error updating flair for user {post.author.name}: {str(e)}") if debugmode else None
+                    print(f"Error updating flair for user {post.author.name}: {e}") if debugmode else None
 
-
-            if config['usernote'].get(flair_guid):
-                print(f"usernote triggered in r/{subreddit.display_name}") if debugmode else None
+            if 'usernote' in config and config['usernote'].get(flair_guid):
+                print(f"usernote triggered in /r/{subreddit.display_name}") if debugmode else None
                 author = post.author.name
                 note_text = config['usernote'][flair_guid]
                 link = post.permalink
@@ -545,20 +567,28 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit):
 
                 await update_usernotes(subreddit, author, note_text, link, mod_name)
 
-            if 'remove_link_flair' in config and flair_guid in config['remove_link_flair']:
-                print(f"remove_link_flair triggered in r/{subreddit.display_name}") if debugmode else None
+            if 'remove_link_flair' in config and 'remove_link_flair' in config and flair_guid in config['remove_link_flair']:
+                print(f"remove_link_flair triggered in /r/{subreddit.display_name}") if debugmode else None
                 await post.mod.flair(text='', css_class='')
 
             if 'add_contributor' in config and flair_guid in config['add_contributor']:
-                print(f"add_contributor triggered in r/{subreddit.display_name}") if debugmode else None
-                await subreddit.contributor.add(post.author)
+                print(f"add_contributor triggered in /r/{subreddit.display_name}") if debugmode else None
+                try:
+                    await subreddit.contributor.add(post.author)
+                except asyncpraw.exceptions.RedditAPIException as e:
+                    print(f"Error adding contributor: {e}") if debugmode else None
 
             if 'remove_contributor' in config and flair_guid in config['remove_contributor']:
-                print(f"remove_contributor triggered in r/{subreddit.display_name}") if debugmode else None
-                await subreddit.contributor.remove(post.author)
+                print(f"remove_contributor triggered in /r/{subreddit.display_name}") if debugmode else None
+                try:
+                    await subreddit.contributor.remove(post.author)
+                except asyncpraw.exceptions.RedditAPIException as e:
+                    print(f"Error removing contributor: {e}") if debugmode else None
 
-            # Send webhook notification
-            send_webhook_notification(config, post, flair_text, log_entry.mod.name, flair_guid)
+            if  'send_to_webhook' in config and 'send_to_webhook' in config and flair_guid in config['send_to_webhook']:
+                print(f"send_to_webhook triggered in /r/{subreddit.display_name}") if debugmode else None
+                # Send webhook notification
+                send_webhook_notification(config, post, flair_text, log_entry.mod.name, flair_guid)
 
 
 # Handle Private Messages to allow the bot to reply back with a list of flairs for convenience
@@ -568,9 +598,8 @@ async def handle_private_messages(reddit):
             subject = message.subject.lower()
             body = message.body.strip()
             subreddit_name = body.split()[0]
-            use_rules = len(body.split()) > 1 and body.split()[1].lower() == 'rules'
 
-            print(f"PM Received") if debugmode else None
+            print(f"PM Received for {subreddit_name}") if debugmode else None
 
             if not re.match(r'^[a-zA-Z0-9_]{3,21}$', subreddit_name):
                 response = "Invalid subreddit name. The subreddit name must be between 3 and 21 characters long and can only contain letters, numbers, and underscores."
@@ -580,7 +609,7 @@ async def handle_private_messages(reddit):
                     await subreddit.load()  # Load the subreddit data
 
                     if subject == 'list':
-                        print(f"'list' PM Received") if debugmode else None
+                        print(f"'list' PM Received for {subreddit_name}") if debugmode else None
                         if subreddit.user_is_moderator:  # Use the property directly
                             mod_flair_templates = [
                                 f"{template['text']}: {template['id']}"
@@ -588,31 +617,22 @@ async def handle_private_messages(reddit):
                                 if template['mod_only']
                             ]
                             if mod_flair_templates:
-                                response = "Mod-only flair templates:\n\n" + "\n\n".join(mod_flair_templates)
+                                response = f"Mod-only flair templates for /r/{subreddit_name}:\n\n" + "\n\n".join(mod_flair_templates)
                             else:
-                                response = "No mod-only flair templates found for r/{}.".format(subreddit_name)
+                                response = f"No mod-only flair templates found for /r/{subreddit_name}."
                         else:
-                            response = "You are not a moderator of r/{}.".format(subreddit_name)
+                            response = f"You are not a moderator of /r/{subreddit_name}."
 
                     elif subject == 'auto':
                         try:
-                            print(f"'auto' PM Received") if debugmode else None
+                            print(f"'auto' PM Received for {subreddit_name}") if debugmode else None
                             if subreddit.user_is_moderator:  # Use the property directly
-                                use_rules = body.split()[1].lower() == 'rules' if len(body.split()) > 1 else False
 
-                                if use_rules:
-                                    rules = [rule async for rule in subreddit.rules]
-                                    flair_templates = []
-                                    for rule in rules:
-                                        flair_templates.append({
-                                            'text': rule.short_name,
-                                            'id': rule.violation_reason
-                                        })
-                                else:
-                                    flair_templates = [
-                                        template async for template in subreddit.flair.link_templates
-                                        if template['mod_only']
-                                    ]
+                                # Filter for mod-only flair templates
+                                flair_templates = [
+                                    template async for template in subreddit.flair.link_templates
+                                    if template['mod_only']
+                                ]
 
                                 config = {
                                     'header': "Hi /u/{{author}}, thanks for contributing to /r/{{subreddit}}. Unfortunately, your post was removed as it violates our rules:",
@@ -620,6 +640,7 @@ async def handle_private_messages(reddit):
                                     'flairs': {},
                                     'remove': {},
                                     'lock_post': {},
+                                    'spoiler': {},
                                     'comment': {},
                                     'removal_comment_type': 'public_as_subreddit',
                                     'usernote': {},
@@ -630,15 +651,9 @@ async def handle_private_messages(reddit):
                                     flair_id = template['id']
                                     flair_text = template['text']
                                     config['flairs'][flair_id] = f"Removal violation: {flair_text}"
-
-                                # Limit the number of flairs used in remove, lock_post, comment, and usernote sections
-                                limited_flairs = flair_templates[:4]
-
-                                for template in limited_flairs:
-                                    flair_id = template['id']
-                                    flair_text = template['text']
                                     config['remove'][flair_id] = True
                                     config['lock_post'][flair_id] = True
+                                    config['spoiler'][flair_id] = True
                                     config['comment'][flair_id] = True
                                     config['usernote'][flair_id] = f"Post violated rule: {flair_text}"
 
@@ -648,23 +663,65 @@ async def handle_private_messages(reddit):
                                 response = f"Here's a sample Flair Helper 2 configuration for /r/{subreddit_name} which you can place in [https://www.reddit.com/r/{subreddit_name}/wiki/flair_helper](https://www.reddit.com/r/{subreddit_name}/wiki/flair_helper)\n\n"
                                 response += formatted_yaml_output
                                 response += "\n\nPlease be sure to review all the detected flairs and remove any that may not be applicable (such as Mod Announcements, Notices, News, etc.)"
+
+                                # Check if the response exceeds the 10k character limit
+                                while len(response) > 10000:
+                                    print(f"Response length > 10000 and is currently {len(response)}, removing extra entries") if debugmode else None
+
+                                    # Get the list of flair IDs
+                                    flair_ids = list(config['flairs'].keys())
+
+                                    # Check if the response exceeds the 10k character limit
+                                    while len(response) > 10000:
+                                        print(f"Response length > 10000 and is currently {len(response)}, removing extra entries") if debugmode else None
+
+                                        # Get the list of flair IDs from the action sections
+                                        action_flair_ids = list(config['remove'].keys())
+
+                                        # Check if there are any flair IDs left to remove from the action sections
+                                        if action_flair_ids:
+                                            # Remove the last flair ID from the action sections
+                                            last_flair_id = action_flair_ids.pop()
+
+                                            if last_flair_id in config['remove']:
+                                                del config['remove'][last_flair_id]
+                                            if last_flair_id in config['lock_post']:
+                                                del config['lock_post'][last_flair_id]
+                                            if last_flair_id in config['spoiler']:
+                                                del config['spoiler'][last_flair_id]
+                                            if last_flair_id in config['comment']:
+                                                del config['comment'][last_flair_id]
+                                            if last_flair_id in config['usernote']:
+                                                del config['usernote'][last_flair_id]
+                                        else:
+                                            # If there are no more flair IDs to remove from the action sections, break the loop
+                                            break
+
+                                        # Regenerate the YAML output and response
+                                        yaml_output = yaml.dump(config, sort_keys=False)
+                                        formatted_yaml_output = "    " + yaml_output.replace("\n", "\n    ")
+
+                                        response = f"Here's a sample Flair Helper 2 configuration for /r/{subreddit_name} which you can place in [https://www.reddit.com/r/{subreddit_name}/wiki/flair_helper](https://www.reddit.com/r/{subreddit_name}/wiki/flair_helper)\n\n"
+                                        response += formatted_yaml_output
+                                        response += "\n\nPlease be sure to review all the detected flairs and remove any that may not be applicable (such as Mod Announcements, Notices, News, etc.)"
+
                                 print(f"\n\nFormatted Yaml Output Message:\n\n{response}") if debugmode else None
                             else:
-                                response = "You are not a moderator of r/{}.".format(subreddit_name)
+                                response = f"You are not a moderator of /r/{subreddit_name}."
                         except asyncprawcore.exceptions.NotFound:
-                            response = "Subreddit r/{} not found.".format(subreddit_name)
+                            response = f"Subreddit /r/{subreddit_name} not found."
 
                     else:
                         response = "Unknown command. Available commands: 'list', 'auto'."
 
                 except asyncprawcore.exceptions.NotFound:
-                    response = "Subreddit r/{} not found.".format(subreddit_name)
+                    response = f"Subreddit /r/{subreddit_name} not found."
 
             await message.mark_read()
             try:
                 await message.reply(response)
             except Exception as e:
-                error_output = f"Error replying to message: {str(e)}"
+                error_output = f"Error replying to message: {e}"
                 print(error_output) if debugmode else None
                 errors_logger.error(error_output)
 
@@ -676,22 +733,22 @@ async def monitor_mod_log(reddit, subreddit, config):
         async for log_entry in subreddit.mod.stream.log(skip_existing=True):
             print(f"New log entry: {log_entry.action}") if verbosemode else None
             if log_entry.action == 'editflair':
-                print(f"Flair action detected in r/{subreddit.display_name}") if debugmode else None
+                print(f"Flair action detected in /r/{subreddit.display_name}") if debugmode else None
                 if log_entry.target_fullname:
                     await process_flair_assignment(reddit, log_entry, config, subreddit)  # Ensure process_flair_assignment is also async
                 else:
                     print(f"No target found") if debugmode else None
             elif log_entry.action == 'wikirevise':
                 if 'flair_helper' in log_entry.details:
-                    print(f"Flair Helper wiki page revised in r/{subreddit.display_name}") if debugmode else None
+                    print(f"Flair Helper wiki page revised in /r/{subreddit.display_name}") if debugmode else None
                     try:
                         await fetch_and_cache_configs(reddit, max_retries=2, retry_delay=5, single_sub=subreddit.display_name)  # Make sure fetch_and_cache_configs is async
                     except asyncprawcore.exceptions.NotFound:
-                        error_output = f"Flair Helper wiki page not found in r/{subreddit.display_name}"
+                        error_output = f"Flair Helper wiki page not found in /r/{subreddit.display_name}"
                         print(error_output) if debugmode else None
                         errors_logger.error(error_output)
             else:
-                print(f"Ignoring action: {log_entry.action} in r/{subreddit.display_name}") if verbosemode else None
+                print(f"Ignoring action: {log_entry.action} in /r/{subreddit.display_name}") if verbosemode else None
     except asyncprawcore.exceptions.ResponseException as e:
         error_output = f"Error: {e}"
         print(error_output) if debugmode else None
@@ -716,17 +773,17 @@ async def run_bot_async(reddit):
     for subreddit in moderated_subreddits:
         subreddit_name = subreddit.display_name
         if f"u_{bot_username}" in subreddit_name:
-            print(f"Skipping bot's own user page: r/{subreddit_name}") if debugmode else None
+            print(f"Skipping bot's own user page: /r/{subreddit_name}") if debugmode else None
             continue  # Skip the bot's own user page
 
         config = get_cached_config(subreddit_name)  # This seems like a synchronous operation
 
         if config:
-            print(f"Monitoring mod log for r/{subreddit_name}")
+            print(f"Monitoring mod log for /r/{subreddit_name}")
             task = asyncio.create_task(monitor_mod_log(reddit, subreddit, config))
             tasks.append(task)
         else:
-            print(f"No Flair Helper configuration found for r/{subreddit_name}")
+            print(f"No Flair Helper configuration found for /r/{subreddit_name}")
 
     if tasks:
         await asyncio.gather(*tasks)
