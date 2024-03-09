@@ -53,7 +53,7 @@ def get_cached_config(subreddit_name):
     result = c.fetchone()
     conn.close()
     if result:
-        return yaml.load(result[0], Loader=yaml.FullLoader)
+        return yaml.safe_load(result[0])  # Use yaml.safe_load instead of yaml.load
     return None
 
 def fetch_and_cache_configs(max_retries=2, retry_delay=5, single_sub=None):
@@ -221,7 +221,7 @@ def send_webhook_notification(config, post, flair_text, mod_name, flair_guid):
         webhook = DiscordWebhook(url=webhook_url)
 
         # Create the embed
-        embed = DiscordEmbed(title=f"{post.title}", url="https://www.reddit.com"+post.permalink, description=post.link_flair_text, color=242424)
+        embed = DiscordEmbed(title=f"{post.title}", url="https://www.reddit.com"+post.permalink, description="Post Flaired: "+post.link_flair_text, color=242424)
         embed.add_embed_field(name="Author", value=post.author.name)
         embed.add_embed_field(name="Score", value=post.score)
         embed.add_embed_field(name="Created", value=datetime.utcfromtimestamp(post.created_utc).strftime('%b %u %Y %H:%M:%S UTC'))
@@ -268,6 +268,8 @@ def process_flair_assignment(log_entry, config, subreddit):
         post = reddit.submission(submission_id)
         flair_guid = post.link_flair_template_id
         print(f"Flair GUID detected: {flair_guid}")
+        # Reload the configuration from the database
+        config = get_cached_config(subreddit.display_name)
         if flair_guid in config['flairs']:
             # Retrieve the flair details from the configuration
             flair_details = config['flairs'][flair_guid]
@@ -399,12 +401,20 @@ def process_flair_assignment(log_entry, config, subreddit):
                 flair_css_class = current_flair['flair_css_class'] if current_flair else ''
 
                 if config['set_author_flair_text'].get(flair_guid):
-                    flair_text = config['set_author_flair_text'][flair_guid]
+                    new_flair_text = config['set_author_flair_text'][flair_guid]
+                    flair_text = new_flair_text.replace('{{author_flair_text}}', flair_text)
+                    print(f"Updating flair text to: '{flair_text}'") if debugmode else None
 
                 if config['set_author_flair_css_class'].get(flair_guid):
-                    flair_css_class = config['set_author_flair_css_class'][flair_guid]
+                    new_flair_css_class = config['set_author_flair_css_class'][flair_guid]
+                    flair_css_class = new_flair_css_class.replace('{{author_flair_css_class}}', flair_css_class)
+                    print(f"Updating flair CSS class to: '{flair_css_class}'") if debugmode else None
 
-                subreddit.flair.set(post.author.name, text=flair_text, css_class=flair_css_class)
+                try:
+                    subreddit.flair.set(post.author.name, text=flair_text, css_class=flair_css_class)
+                    print(f"Flair updated for user {post.author.name}: text='{flair_text}', css_class='{flair_css_class}'") if debugmode else None
+                except Exception as e:
+                    print(f"Error updating flair for user {post.author.name}: {str(e)}") if debugmode else None
 
             if config['usernote'].get(flair_guid):
                 print(f"usernote triggered in r/{subreddit.display_name}") if debugmode else None
@@ -456,11 +466,11 @@ def handle_private_messages():
                                 if template['mod_only']
                             ]
                             if mod_flair_templates:
-                                response = "Mod-only flair templates:\n\n" + "\n\n".join(mod_flair_templates)
+                                response = f"Mod-only flair templates for /r/{subreddit_name}:\n\n" + "\n\n".join(mod_flair_templates)
                             else:
-                                response = "No mod-only flair templates found for r/{}.".format(subreddit_name)
+                                response = f"No mod-only flair templates found for /r/{subreddit_name}."
                         else:
-                            response = "You are not a moderator of r/{}.".format(subreddit_name)
+                            response = f"You are not a moderator of /r/{subreddit_name}."
 
                     elif subject == 'auto':
                         try:
@@ -477,7 +487,11 @@ def handle_private_messages():
                                             'id': rule.violation_reason
                                         })
                                 else:
-                                    flair_templates = list(subreddit.flair.link_templates)
+                                    # Filter for mod-only flair templates
+                                    flair_templates = [
+                                        template for template in subreddit.flair.link_templates
+                                        if template['mod_only']
+                                    ]
 
                                 config = {
                                     'header': "Hi /u/{{author}}, thanks for contributing to /r/{{subreddit}}. Unfortunately, your post was removed as it violates our rules:",
@@ -510,8 +524,9 @@ def handle_private_messages():
                                 yaml_output = yaml.dump(config, sort_keys=False)
                                 formatted_yaml_output = "    " + yaml_output.replace("\n", "\n    ")
 
-                                response = "Here's a sample Flair Helper 2 configuration for your subreddit:\n\n"
+                                response = f"Here's a sample Flair Helper 2 configuration for /r/{subreddit_name} which you can place in [https://www.reddit.com/r/{subreddit_name}/wiki/flair_helper](https://www.reddit.com/r/{subreddit_name}/wiki/flair_helper)\n\n"
                                 response += formatted_yaml_output
+                                response += "\n\nPlease be sure to review all the detected flairs and remove any that may not be applicable (such as Mod Announcements, Notices, News, etc.)"
                                 print(f"\n\nFormatted Yaml Output Message:\n\n{response}") if debugmode else None
                             else:
                                 response = "You are not a moderator of r/{}.".format(subreddit_name)
@@ -531,7 +546,6 @@ def handle_private_messages():
                 error_output = f"Error replying to message: {str(e)}"
                 print(error_output) if debugmode else None
                 errors_logger.error(error_output)
-
 
 
 # Primary Mod Log Monitor
