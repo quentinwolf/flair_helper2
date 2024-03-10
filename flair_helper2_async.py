@@ -171,7 +171,7 @@ async def fetch_and_cache_configs(reddit, max_retries=2, retry_delay=5, single_s
                                 pass
                             else:
                                 # The moderator does not have the 'config' permission or is not a moderator
-                                await error_handler(f"Mod {mod_name} does not have permission to edit config in /r/{subreddit.display_name}", notify_discord=True)
+                                await error_handler(f"Mod {mod_name} does not have permission to edit config in /r/{subreddit.display_name}\n\nMod {mod_name} has the following permissions in /r/{subreddit.display_name}: {mod_permissions}", notify_discord=True)
                                 break  # Skip reloading the configuration and continue with the next subreddit
 
                         try:
@@ -362,16 +362,28 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit):
         submission_id = target_fullname[3:]  # Remove the 't3_' prefix
         post = await reddit.submission(submission_id)
         flair_guid = getattr(post, 'link_flair_template_id', None)  # Use getattr to safely retrieve the attribute
-        print(f"Flair GUID detected: {flair_guid}")
+        # Get the post title and author for debugging
+        post_author_name = post.author.name if post.author else "[deleted]"
+        print(f"Flair GUID {flair_guid} detected on post '{post.title}' by {post_author_name} in /r/{subreddit.display_name}") if debugmode else None
+        # boolean variable to track whether the author is deleted or suspended:
+        is_author_deleted_or_suspended = post_author_name == "[deleted]"
+
         # Reload the configuration from the database
         config = get_cached_config(subreddit.display_name)
         if flair_guid and flair_guid in config['flairs']:
+
+            # Retrieve the flair details from the configuration
+            flair_details = config['flairs'][flair_guid]
 
             await post.load()
             # Now that post data is loaded, ensure that author data is loaded
             if post.author:
                 await post.author.load()
-                author_id = post.author.id
+                if hasattr(post.author, 'is_suspended') and post.author.is_suspended:
+                    author_id = None
+                    print(f"Skipping author ID for suspended user: {post.author.name}") if debugmode else None
+                else:
+                    author_id = post.author.id
             else:
                 # Handle the case where the post may not have an author (e.g., deleted account)
                 author_id = None
@@ -393,8 +405,30 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit):
                 flair_text = current_flair.get('flair_text', '')
                 flair_css_class = current_flair.get('flair_css_class', '')
 
-            # Retrieve the flair details from the configuration
-            flair_details = config['flairs'][flair_guid]
+            # Format the header, flair details, and footer with the placeholders
+            formatted_header = config['header']
+            formatted_footer = config['footer']
+
+            skip_add_newlines = config.get('skip_add_newlines', False)
+            require_config_to_edit = config.get('require_config_to_edit', False)
+            ignore_same_flair_seconds = config.get('ignore_same_flair_seconds', 60)
+
+            if not skip_add_newlines:
+                formatted_header += "\n\n"
+                formatted_footer = "\n\n" + formatted_footer
+
+            last_flair_time = getattr(post, '_last_flair_time', 0)
+            if time.time() - last_flair_time < ignore_same_flair_seconds:
+                print(f"Ignoring same flair action within {ignore_same_flair_seconds} seconds") if debugmode else None
+                return
+            post._last_flair_time = time.time()
+
+            for placeholder, value in placeholders.items():
+                formatted_header = formatted_header.replace(f"{{{{{placeholder}}}}}", str(value))
+                formatted_flair_details = flair_details.replace(f"{{{{{placeholder}}}}}", str(value))
+                formatted_footer = formatted_footer.replace(f"{{{{{placeholder}}}}}", str(value))
+
+            removal_reason = f"{formatted_header}\n\n{formatted_flair_details}\n\n{formatted_footer}"
 
             utc_offset = config.get('utc_offset', 0)
             custom_time_format = config.get('custom_time_format', '')
@@ -417,7 +451,7 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit):
 
             # Create a dictionary to store the placeholder values
             placeholders.update({
-                'author': post.author.name,
+                'author': post_author_name,
                 'subreddit': post.subreddit.display_name,
                 'body': post.selftext,
                 'title': post.title,
@@ -434,46 +468,10 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit):
                 'link_flair_text': post.link_flair_text if post.link_flair_text else '',
                 'link_flair_css_class': post.link_flair_css_class if post.link_flair_css_class else '',
                 'link_flair_template_id': post.link_flair_template_id if post.link_flair_template_id else '',
-                'author_id': post.author.id,
+                'author_id': author_id,
                 'subreddit_id': post.subreddit.id
             })
 
-            # Format the header, flair details, and footer with the placeholders
-            formatted_header = config['header']
-            formatted_flair_details = flair_details
-            formatted_footer = config['footer']
-
-            skip_add_newlines = config.get('skip_add_newlines', False)
-            require_config_to_edit = config.get('require_config_to_edit', False)
-            ignore_same_flair_seconds = config.get('ignore_same_flair_seconds', 60)
-
-            if not skip_add_newlines:
-                formatted_header += "\n\n"
-                formatted_footer = "\n\n" + formatted_footer
-
-            if require_config_to_edit:
-                try:
-                    mod = await reddit.redditor(log_entry.mod.name)
-                    await mod.load()
-                    if not mod.has_permission('config'):
-                        await error_handler(f"Mod {log_entry.mod.name} does not have permission to edit config", notify_discord=True)
-                        return
-                except Exception as e:
-                    await error_handler(f"Error loading mod {log_entry.mod.name}: {e}", notify_discord=True)
-                    return
-
-            last_flair_time = getattr(post, '_last_flair_time', 0)
-            if time.time() - last_flair_time < ignore_same_flair_seconds:
-                print(f"Ignoring same flair action within {ignore_same_flair_seconds} seconds") if debugmode else None
-                return
-            post._last_flair_time = time.time()
-
-            for placeholder, value in placeholders.items():
-                formatted_header = formatted_header.replace(f"{{{{{placeholder}}}}}", str(value))
-                formatted_flair_details = formatted_flair_details.replace(f"{{{{{placeholder}}}}}", str(value))
-                formatted_footer = formatted_footer.replace(f"{{{{{placeholder}}}}}", str(value))
-
-            removal_reason = f"{formatted_header}\n\n{formatted_flair_details}\n\n{formatted_footer}"
 
             # Execute the configured actions
             if 'approve' in config and config['approve'].get(flair_guid, False):
@@ -517,37 +515,6 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit):
                         except asyncpraw.exceptions.RedditAPIException as e:
                             await error_handler(f"process_flair_assignment: Error replying with comment in /r/{subreddit.display_name}: {e}", notify_discord=True)
 
-            # Check if banning is configured for the flair GUID
-            if 'bans' in config and flair_guid in config['bans']:
-                ban_duration = config['bans'][flair_guid]
-                ban_message = config['ban_message'].get(flair_guid) if 'ban_message' in config else None
-                ban_note = config['ban_note'].get(flair_guid) if 'ban_note' in config else None
-
-                print(f"Debugging: ban_duration={ban_duration}, ban_message={ban_message}, ban_note={ban_note}") if debugmode else None
-
-                if ban_message:
-                    for placeholder, value in placeholders.items():
-                        ban_message = ban_message.replace(f"{{{{{placeholder}}}}}", str(value))
-
-                if ban_duration is True:
-                    print(f"permanent ban triggered in /r/{subreddit.display_name}") if debugmode else None
-                    await subreddit.banned.add(post.author, ban_message=ban_message, ban_reason=ban_note)
-                elif isinstance(ban_duration, int) and ban_duration > 0:
-                    print(f"temporary ban triggered for {ban_duration} days in /r/{subreddit.display_name}") if debugmode else None
-                    try:
-                        await subreddit.banned.add(post.author, ban_message=ban_message, ban_reason=ban_note, duration=ban_duration)
-                    except Exception as e:
-                        await error_handler(f"process_flair_assignment: Error banning user {post.author.name} in /r/{subreddit.display_name}: {e}", notify_discord=True)
-                else:
-                    print(f"banning not triggered for flair GUID: {flair_guid} in /r/{subreddit.display_name}") if debugmode else None
-
-            if 'unbans' in config and flair_guid in config['unbans']:
-                print(f"unban triggered in /r/{subreddit.display_name}") if debugmode else None
-                try:
-                    await subreddit.banned.remove(post.author)
-                except Exception as e:
-                    await error_handler(f"process_flair_assignment: Error unbanning user {post.author.name} in /r/{subreddit.display_name}: {e}", notify_discord=True)
-
             if 'lock_post' in config and config['lock_post'].get(flair_guid, False):
                 print(f"lock triggered in /r/{subreddit.display_name}") if debugmode else None
                 await post.mod.lock()
@@ -556,60 +523,96 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit):
                 print(f"spoiler triggered in /r/{subreddit.display_name}") if debugmode else None
                 await post.mod.spoiler()
 
-            if 'set_author_flair_text' in config and config['set_author_flair_text'].get(flair_guid) or 'set_author_flair_css_class' in config and config['set_author_flair_css_class'].get(flair_guid):
-                print(f"set_author_flair triggered in /r/{subreddit.display_name}") if debugmode else None
-
-                print(f"Current flair: text='{flair_text}', css_class='{flair_css_class}'") if debugmode else None
-                # Update the flair text based on the configuration
-                if 'set_author_flair_text' in config and config['set_author_flair_text'].get(flair_guid):
-                    new_flair_text = config['set_author_flair_text'][flair_guid]
-                    flair_text = new_flair_text.replace('{{author_flair_text}}', flair_text)
-                    print(f"Updating flair text to: '{flair_text}'") if debugmode else None
-
-                # Update the flair CSS class based on the configuration
-                if 'set_author_flair_css_class' in config and config['set_author_flair_css_class'].get(flair_guid):
-                    new_flair_css_class = config['set_author_flair_css_class'][flair_guid]
-                    flair_css_class = new_flair_css_class.replace('{{author_flair_css_class}}', flair_css_class)
-                    print(f"Updating flair CSS class to: '{flair_css_class}'") if debugmode else None
-
-                # Set the updated flair for the user
-                try:
-                    await subreddit.flair.set(post.author.name, text=flair_text, css_class=flair_css_class)
-                    print(f"Flair updated for user {post.author.name}: text='{flair_text}', css_class='{flair_css_class}'") if debugmode else None
-                except Exception as e:
-                    await error_handler(f"process_flair_assignment: Error updating flair for {post.author.name} in /r/{subreddit.display_name}: {e}", notify_discord=True)
-
-            if 'usernote' in config and config['usernote'].get(flair_guid):
-                print(f"usernote triggered in /r/{subreddit.display_name}") if debugmode else None
-                author = post.author.name
-                note_text = config['usernote'][flair_guid]
-                link = post.permalink
-                mod_name = log_entry.mod.name
-                usernote_type_name = config.get('usernote_type_name', None)
-                await update_usernotes(subreddit, author, note_text, link, mod_name, usernote_type_name)
-
             if 'remove_link_flair' in config and 'remove_link_flair' in config and flair_guid in config['remove_link_flair']:
                 print(f"remove_link_flair triggered in /r/{subreddit.display_name}") if debugmode else None
                 await post.mod.flair(text='', css_class='')
-
-            if 'add_contributor' in config and flair_guid in config['add_contributor']:
-                print(f"add_contributor triggered in /r/{subreddit.display_name}") if debugmode else None
-                try:
-                    await subreddit.contributor.add(post.author)
-                except asyncpraw.exceptions.RedditAPIException as e:
-                    await error_handler(f"process_flair_assignment: Error adding contributor in /r/{subreddit.display_name}: {e}", notify_discord=True)
-
-            if 'remove_contributor' in config and flair_guid in config['remove_contributor']:
-                print(f"remove_contributor triggered in /r/{subreddit.display_name}") if debugmode else None
-                try:
-                    await subreddit.contributor.remove(post.author)
-                except asyncpraw.exceptions.RedditAPIException as e:
-                    await error_handler(f"process_flair_assignment: Error removing contributor in /r/{subreddit.display_name}: {e}", notify_discord=True)
 
             if  'send_to_webhook' in config and 'send_to_webhook' in config and flair_guid in config['send_to_webhook']:
                 print(f"send_to_webhook triggered in /r/{subreddit.display_name}") if debugmode else None
                 # Send webhook notification
                 send_webhook_notification(config, post, flair_text, log_entry.mod.name, flair_guid)
+
+
+            # Only process the below if not suspended or deleted
+            if not is_author_deleted_or_suspended:
+
+                # Check if banning is configured for the flair GUID
+                if 'bans' in config and flair_guid in config['bans']:
+                    ban_duration = config['bans'][flair_guid]
+                    ban_message = config['ban_message'].get(flair_guid) if 'ban_message' in config else None
+                    ban_note = config['ban_note'].get(flair_guid) if 'ban_note' in config else None
+
+                    print(f"Debugging: ban_duration={ban_duration}, ban_message={ban_message}, ban_note={ban_note}") if debugmode else None
+
+                    if ban_message:
+                        for placeholder, value in placeholders.items():
+                            ban_message = ban_message.replace(f"{{{{{placeholder}}}}}", str(value))
+
+                    if ban_duration is True:
+                        print(f"permanent ban triggered in /r/{subreddit.display_name}") if debugmode else None
+                        await subreddit.banned.add(post.author, ban_message=ban_message, ban_reason=ban_note)
+                    elif isinstance(ban_duration, int) and ban_duration > 0:
+                        print(f"temporary ban triggered for {ban_duration} days in /r/{subreddit.display_name}") if debugmode else None
+                        try:
+                            await subreddit.banned.add(post.author, ban_message=ban_message, ban_reason=ban_note, duration=ban_duration)
+                        except Exception as e:
+                            await error_handler(f"process_flair_assignment: Error banning user {post_author_name} in /r/{subreddit.display_name}: {e}", notify_discord=True)
+                    else:
+                        print(f"banning not triggered for flair GUID: {flair_guid} in /r/{subreddit.display_name}") if debugmode else None
+
+                if 'unbans' in config and flair_guid in config['unbans']:
+                    print(f"unban triggered in /r/{subreddit.display_name}") if debugmode else None
+                    try:
+                        await subreddit.banned.remove(post.author)
+                    except Exception as e:
+                        await error_handler(f"process_flair_assignment: Error unbanning user {post_author_name} in /r/{subreddit.display_name}: {e}", notify_discord=True)
+
+                if 'set_author_flair_text' in config and config['set_author_flair_text'].get(flair_guid) or 'set_author_flair_css_class' in config and config['set_author_flair_css_class'].get(flair_guid):
+                    print(f"set_author_flair triggered in /r/{subreddit.display_name}") if debugmode else None
+
+                    print(f"Current flair: text='{flair_text}', css_class='{flair_css_class}'") if debugmode else None
+                    # Update the flair text based on the configuration
+                    if 'set_author_flair_text' in config and config['set_author_flair_text'].get(flair_guid):
+                        new_flair_text = config['set_author_flair_text'][flair_guid]
+                        flair_text = new_flair_text.replace('{{author_flair_text}}', flair_text)
+                        print(f"Updating flair text to: '{flair_text}'") if debugmode else None
+
+                    # Update the flair CSS class based on the configuration
+                    if 'set_author_flair_css_class' in config and config['set_author_flair_css_class'].get(flair_guid):
+                        new_flair_css_class = config['set_author_flair_css_class'][flair_guid]
+                        flair_css_class = new_flair_css_class.replace('{{author_flair_css_class}}', flair_css_class)
+                        print(f"Updating flair CSS class to: '{flair_css_class}'") if debugmode else None
+
+                    # Set the updated flair for the user
+                    try:
+                        await subreddit.flair.set(post.author.name, text=flair_text, css_class=flair_css_class)
+                        print(f"Flair updated for user {post_author_name}: text='{flair_text}', css_class='{flair_css_class}'") if debugmode else None
+                    except Exception as e:
+                        await error_handler(f"process_flair_assignment: Error updating flair for {post_author_name} in /r/{subreddit.display_name}: {e}", notify_discord=True)
+
+                if 'usernote' in config and config['usernote'].get(flair_guid):
+                    print(f"usernote triggered in /r/{subreddit.display_name}") if debugmode else None
+                    author = post_author_name
+                    note_text = config['usernote'][flair_guid]
+                    link = post.permalink
+                    mod_name = log_entry.mod.name
+                    usernote_type_name = config.get('usernote_type_name', None)
+                    await update_usernotes(subreddit, author, note_text, link, mod_name, usernote_type_name)
+
+                if 'add_contributor' in config and flair_guid in config['add_contributor']:
+                    print(f"add_contributor triggered in /r/{subreddit.display_name}") if debugmode else None
+                    try:
+                        await subreddit.contributor.add(post.author)
+                    except asyncpraw.exceptions.RedditAPIException as e:
+                        await error_handler(f"process_flair_assignment: Error adding contributor in /r/{subreddit.display_name}: {e}", notify_discord=True)
+
+                if 'remove_contributor' in config and flair_guid in config['remove_contributor']:
+                    print(f"remove_contributor triggered in /r/{subreddit.display_name}") if debugmode else None
+                    try:
+                        await subreddit.contributor.remove(post.author)
+                    except asyncpraw.exceptions.RedditAPIException as e:
+                        await error_handler(f"process_flair_assignment: Error removing contributor in /r/{subreddit.display_name}: {e}", notify_discord=True)
+
 
 
 # Handle Private Messages to allow the bot to reply back with a list of flairs for convenience
@@ -853,14 +856,15 @@ async def monitor_mod_log(reddit, subreddit, config):
         async for log_entry in subreddit.mod.stream.log(skip_existing=True):
             print(f"New log entry: {log_entry.action}") if verbosemode else None
             if log_entry.action == 'editflair':
-                print(f"Flair action detected in /r/{subreddit.display_name}") if debugmode else None
                 if log_entry.target_fullname:
+                    # Get the post object
+                    print(f"Flair action detected by {log_entry.mod} in /r/{log_entry.subreddit}") if debugmode else None
                     await process_flair_assignment(reddit, log_entry, config, subreddit)  # Ensure process_flair_assignment is also async
                 else:
                     print(f"No target found") if debugmode else None
             elif log_entry.action == 'wikirevise':
                 if 'flair_helper' in log_entry.details:
-                    print(f"Flair Helper wiki page revised in /r/{subreddit.display_name}") if debugmode else None
+                    print(f"Flair Helper wiki page revised by {log_entry.mod} in /r/{log_entry.subreddit}") if debugmode else None
                     try:
                         await fetch_and_cache_configs(reddit, max_retries=2, retry_delay=5, single_sub=subreddit.display_name)  # Make sure fetch_and_cache_configs is async
                     except asyncprawcore.exceptions.NotFound:
