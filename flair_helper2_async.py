@@ -865,6 +865,7 @@ async def check_new_mod_invitations(reddit, bot_username):
 # Primary Mod Log Monitor
 async def monitor_mod_log(reddit, subreddit, config, bot_username):
     current_utc_timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+    accounts_to_ignore = ['AssistantBOT1', 'anyadditionalacctshere', 'thatmayinteractwithflair']
     try:
         async for log_entry in subreddit.mod.stream.log(skip_existing=True):
             print(f"{current_utc_timestamp}: New log entry: {log_entry.action}") if verbosemode else None
@@ -877,7 +878,10 @@ async def monitor_mod_log(reddit, subreddit, config, bot_username):
                         error_output = f"monitor_mod_log: Flair Helper wiki page not found in /r/{subreddit.display_name}"
                         print(error_output) if debugmode else None
                         errors_logger.error(error_output)
-            elif log_entry.action == 'editflair' and log_entry.mod != bot_username:
+            elif (log_entry.action == 'editflair'
+              and log_entry.mod not in accounts_to_ignore
+              and log_entry.target_fullname.startswith('t3_')):
+                # This is a link (submission) flair edit
                 if log_entry.target_fullname:
                     # Get the post object
                     print(f"{current_utc_timestamp}: Flair action detected by {log_entry.mod} in /r/{log_entry.subreddit}") if debugmode else None
@@ -886,8 +890,19 @@ async def monitor_mod_log(reddit, subreddit, config, bot_username):
                     print(f"{current_utc_timestamp}: No target found") if debugmode else None
             else:
                 print(f"{current_utc_timestamp}: Ignoring action: {log_entry.action} in /r/{subreddit.display_name}") if verbosemode else None
-    except asyncprawcore.exceptions.ResponseException as e:
-        await error_handler(f"monitor_mod_log: Error in /r/{subreddit.display_name}: {e}", notify_discord=True)
+    except asyncpraw.exceptions.RedditAPIException as e:
+        if e.error_type == "RATELIMIT":
+            wait_time_match = re.search(r"for (\d+) minute", e.message)
+            if wait_time_match:
+                wait_minutes = int(wait_time_match.group(1))
+                print(f"Rate limited. Waiting for {wait_minutes} minutes before retrying.")
+                await asyncio.sleep(wait_minutes * 60)
+                # After waiting, you might need to retry the operation that triggered the rate limit
+            else:
+                print("Rate limited, but could not extract wait time.")
+                await asyncio.sleep(60)  # Wait for a default duration before retrying
+        else:
+            await error_handler(f"monitor_mod_log: Error in /r/{subreddit.display_name}: {e}", notify_discord=True)
 
 
 
