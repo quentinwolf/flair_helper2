@@ -87,9 +87,8 @@ def fetch_and_cache_configs(max_retries=2, retry_delay=5, single_sub=None):
     bot_username = reddit.user.me().name
 
     for subreddit in moderated_subreddits:
-        subreddit_name = subreddit.display_name
-        if f"u_{bot_username}" in subreddit_name:
-            print(f"Skipping bot's own user page: /r/{subreddit_name}") if debugmode else None
+        if f"u_{bot_username}" in subreddit.display_name:
+            print(f"Skipping bot's own user page: /r/{subreddit.display_name}") if debugmode else None
             continue  # Skip the bot's own user page
 
         retries = 0
@@ -99,12 +98,12 @@ def fetch_and_cache_configs(max_retries=2, retry_delay=5, single_sub=None):
                 wiki_content = wiki_page.content_md.strip()
 
                 if not wiki_content:
-                    print(f"Flair Helper configuration for /r/{subreddit_name} is blank. Skipping...") if debugmode else None
+                    print(f"Flair Helper configuration for /r/{subreddit.display_name} is blank. Skipping...") if debugmode else None
                     break  # Skip processing if the wiki page is blank
 
                 try:
                     updated_config = yaml.load(wiki_content, Loader=yaml.FullLoader)
-                    cached_config = get_cached_config(subreddit_name)
+                    cached_config = get_cached_config(subreddit.display_name)
 
                     if cached_config != updated_config:
                         # Check if the mod who edited the wiki page has the "config" permission
@@ -113,55 +112,55 @@ def fetch_and_cache_configs(max_retries=2, retry_delay=5, single_sub=None):
                             mod_name = wiki_revision['author']
                             mod = reddit.redditor(mod_name)
                             if not mod.has_permission('config', subreddit=subreddit):
-                                error_handler(f"Mod {mod_name} does not have permission to edit config in /r/{subreddit_name}", notify_discord=True)
+                                error_handler(f"Mod {mod_name} does not have permission to edit config in /r/{subreddit.display_name}", notify_discord=True)
                                 continue  # Skip reloading the configuration
 
                         try:
                             yaml.load(wiki_content, Loader=yaml.FullLoader)
-                            cache_config(subreddit_name, updated_config)
-                            print(f"The Flair Helper wiki page configuration for /r/{subreddit_name} has been successfully reloaded.") if debugmode else None
+                            cache_config(subreddit.display_name, updated_config)
+                            error_handler(f"The Flair Helper wiki page configuration for /r/{subreddit.display_name} has been successfully cached and reloaded.", notify_discord=True)
 
                             sleep(2)  # Adjust the delay as needed
 
                             try:
-                                reddit.subreddit(subreddit_name).message(
+                                reddit.subreddit(subreddit.display_name).message(
                                     subject="Flair Helper Configuration Reloaded",
-                                    message=f"The Flair Helper configuration for /r/{subreddit_name} has been successfully reloaded."
+                                    message=f"The Flair Helper configuration for /r/{subreddit.display_name} has been successfully reloaded."
                                 )
                             except praw.exceptions.RedditAPIException as e:
-                                error_handler(f"Error sending modmail to /r/{subreddit_name}: {e}", notify_discord=True)
+                                error_handler(f"Error sending modmail to /r/{subreddit.display_name}: {e}", notify_discord=True)
                         except yaml.YAMLError as e:
-                            error_handler(f"Error parsing YAML configuration for /r/{subreddit_name}: {e}", notify_discord=True)
+                            error_handler(f"Error parsing YAML configuration for /r/{subreddit.display_name}: {e}", notify_discord=True)
                             try:
-                                reddit.subreddit(subreddit_name).message(
+                                reddit.subreddit(subreddit.display_name).message(
                                     subject="Flair Helper Configuration Error",
-                                    message=f"The Flair Helper configuration for /r/{subreddit_name} could not be reloaded due to YAML parsing errors:\n\n{e}"
+                                    message=f"The Flair Helper configuration for /r/{subreddit.display_name} could not be reloaded due to YAML parsing errors:\n\n{e}"
                                 )
                             except praw.exceptions.RedditAPIException as e:
-                                error_handler(f"Error sending modmail to /r/{subreddit_name}: {e}", notify_discord=True)
+                                error_handler(f"Error sending modmail to /r/{subreddit.display_name}: {e}", notify_discord=True)
                     else:
-                        print(f"The Flair Helper wiki page configuration for /r/{subreddit_name} has not changed.") if debugmode else None
+                        print(f"The Flair Helper wiki page configuration for /r/{subreddit.display_name} has not changed.") if debugmode else None
                     break  # Configuration loaded successfully, exit the retry loop
                 except (prawcore.exceptions.ResponseException, prawcore.exceptions.RequestException) as e:
-                    error_handler(f"Error loading configuration for /r/{subreddit_name}: {e}", notify_discord=True)
+                    error_handler(f"Error loading configuration for /r/{subreddit.display_name}: {e}", notify_discord=True)
                     retries += 1
                     if retries < max_retries:
                         print(f"Retrying in {retry_delay} seconds...") if debugmode else None
                         time.sleep(retry_delay)
                     else:
-                        print(f"Max retries exceeded for /r/{subreddit_name}. Skipping...") if debugmode else None
+                        print(f"Max retries exceeded for /r/{subreddit.display_name}. Skipping...") if debugmode else None
             except prawcore.exceptions.Forbidden:
-                error_handler(f"Error: Bot does not have permission to access the wiki page in /r/{subreddit_name}", notify_discord=True)
+                error_handler(f"Error: Bot does not have permission to access the wiki page in /r/{subreddit.display_name}", notify_discord=True)
                 break  # Skip retrying if the bot doesn't have permission
             except prawcore.exceptions.NotFound:
-                error_handler(f"Flair Helper wiki page doesn't exist for /r/{subreddit_name}", notify_discord=True)
+                error_handler(f"Flair Helper wiki page doesn't exist for /r/{subreddit.display_name}", notify_discord=True)
                 try:
-                    reddit.subreddit(subreddit_name).message(
+                    reddit.subreddit(subreddit.display_name).message(
                         subject="Flair Helper Wiki Page Not Found",
-                        message=f"The Flair Helper wiki page doesn't exist for /r/{subreddit_name}. Please go to https://www.reddit.com/r/{subreddit_name}/wiki/flair_helper and create the page to add this subreddit.  You can send me a PM with 'list' or 'auto' to generate a sample configuration.\n\n[Generate a List of Flairs](https://www.reddit.com/message/compose?to=/u/{bot_username}&subject=list&message={subreddit_name})\n\n[Auto-Generate a sample Flair Helper Config](https://www.reddit.com/message/compose?to=/u/{bot_username}&subject=auto&message={subreddit_name})\n\nYou can find more information in the Flair Helper documentation on /r/Flair_Helper2/wiki/tutorial/ \n\nHappy Flairing!"
+                        message=f"The Flair Helper wiki page doesn't exist for /r/{subreddit.display_name}. Please go to https://www.reddit.com/r/{subreddit.display_name}/wiki/flair_helper and create the page to add this subreddit.  You can send me a PM with 'list' or 'auto' to generate a sample configuration.\n\n[Generate a List of Flairs](https://www.reddit.com/message/compose?to=/u/{bot_username}&subject=list&message={subreddit.display_name})\n\n[Auto-Generate a sample Flair Helper Config](https://www.reddit.com/message/compose?to=/u/{bot_username}&subject=auto&message={subreddit.display_name})\n\nYou can find more information in the Flair Helper documentation on /r/Flair_Helper2/wiki/tutorial/ \n\nHappy Flairing!"
                     )
                 except praw.exceptions.RedditAPIException as e:
-                    error_handler(f"Error sending modmail to /r/{subreddit_name}: {e}", notify_discord=True)
+                    error_handler(f"Error sending modmail to /r/{subreddit.display_name}: {e}", notify_discord=True)
                 break  # Skip retrying if the wiki page doesn't exist
 
 # Toolbox Note Handlers
@@ -599,9 +598,11 @@ def create_auto_flairhelper_wiki(reddit, subreddit, mode):
     yaml_output = yaml.dump(config, sort_keys=False, allow_unicode=True, width=float("inf"))
 
     if mode == "pm":
-        response = f"Here's a sample Flair Helper 2 configuration for /r/{subreddit_name} which you can place in [https://www.reddit.com/r/{subreddit_name}/wiki/flair_helper](https://www.reddit.com/r/{subreddit_name}/wiki/flair_helper)\n\n"
-        response += yaml_output
-        response += "\n\nPlease be sure to review all the detected flairs and remove any that may not be applicable (such as Mod Announcements, Notices, News, etc.)"
+        formatted_yaml_output = "    " + yaml_output.replace("\n", "\n    ")
+
+        final_output = f"Here's a sample Flair Helper 2 configuration for /r/{subreddit.display_name} which you can place in [https://www.reddit.com/r/{subreddit.display_name}/wiki/flair_helper](https://www.reddit.com/r/{subreddit.display_name}/wiki/flair_helper)\n\nBy default all options are set to 'false' if you wish to enable that specific action for a particular flair, change it to 'true'"
+        final_output += comment + formatted_yaml_output
+        final_output += "\n\nPlease be sure to review all the detected flairs and remove any that may not be applicable (such as Mod Announcements, Notices, News, etc.)"
 
         # Implement the 10,000 character limit on the complete response for private messages
         while len(response) > 10000:
@@ -640,11 +641,10 @@ def create_auto_flairhelper_wiki(reddit, subreddit, mode):
                 yaml_output = yaml.dump(config, sort_keys=False, allow_unicode=True, width=float("inf"))
                 formatted_yaml_output = "    " + yaml_output.replace("\n", "\n    ")
 
-                response = f"Here's a sample Flair Helper 2 configuration for /r/{subreddit_name} which you can place in [https://www.reddit.com/r/{subreddit_name}/wiki/flair_helper](https://www.reddit.com/r/{subreddit_name}/wiki/flair_helper)\n\nBy default all options are set to 'false' if you wish to enable that specific action for a particular flair, change it to 'true'"
-                response += comment + formatted_yaml_output
-                response += "\n\nPlease be sure to review all the detected flairs and remove any that may not be applicable (such as Mod Announcements, Notices, News, etc.)"
+                final_output = f"Here's a sample Flair Helper 2 configuration for /r/{subreddit.display_name} which you can place in [https://www.reddit.com/r/{subreddit.display_name}/wiki/flair_helper](https://www.reddit.com/r/{subreddit.display_name}/wiki/flair_helper)\n\nBy default all options are set to 'false' if you wish to enable that specific action for a particular flair, change it to 'true'"
+                final_output += comment + formatted_yaml_output
+                final_output += "\n\nPlease be sure to review all the detected flairs and remove any that may not be applicable (such as Mod Announcements, Notices, News, etc.)"
 
-                final_output = response
 
     elif mode == "wiki":
         final_output = comment + yaml_output
@@ -665,12 +665,11 @@ def check_new_mod_invitations(reddit):
         new_subreddits = [sub for sub in current_subreddits if sub.display_name not in stored_subreddits]
 
         for subreddit in new_subreddits:
-            subreddit_name = subreddit.display_name
-            if f"u_{bot_username}" in subreddit_name:
-                print(f"Skipping bot's own user page: /r/{subreddit_name}") if debugmode else None
+            if f"u_{bot_username}" in subreddit.display_name:
+                print(f"Skipping bot's own user page: /r/{subreddit.display_name}") if debugmode else None
                 continue  # Skip the bot's own user page
 
-            subreddit_instance = reddit.subreddit(subreddit_name)
+            subreddit_instance = reddit.subreddit(subreddit.display_name)
 
             max_retries = 3
             retry_delay = 5  # Delay in seconds between retries
@@ -684,28 +683,28 @@ def check_new_mod_invitations(reddit):
                         # Flair Helper wiki page exists but is blank
                         auto_gen_config = create_auto_flairhelper_wiki(reddit, subreddit, mode="wiki")
                         subreddit.wiki.create('flair_helper', auto_gen_config)
-                        print(f"Created auto_gen_config for 'flair_helper' wiki page for /r/{subreddit_name}") if debugmode else None
+                        print(f"Created auto_gen_config for 'flair_helper' wiki page for /r/{subreddit.display_name}") if debugmode else None
 
-                        subject = f"Flair Helper Configuration Needed for /r/{subreddit_name}"
-                        message = f"Hi! I noticed that I was recently added as a moderator to /r/{subreddit_name}.\n\nThe Flair Helper wiki page here: /r/{subreddit_name}/wiki/flair_helper exists but was currently blank.  I've went ahead and generated a working config based upon your 'Mod Only' flairs you have configured.  Otherwise, you can send me a PM with 'list' or 'auto' to generate a sample configuration.\n\n[Generate a List of Flairs](https://www.reddit.com/message/compose?to=/u/{bot_username}&subject=list&message={subreddit_name})\n\n[Auto-Generate a sample Flair Helper Config](https://www.reddit.com/message/compose?to=/u/{bot_username}&subject=auto&message={subreddit_name})\n\nYou can find more information in the Flair Helper documentation on /r/Flair_Helper2/wiki/tutorial/ \n\nHappy Flairing!"
+                        subject = f"Flair Helper Configuration Needed for /r/{subreddit.display_name}"
+                        message = f"Hi! I noticed that I was recently added as a moderator to /r/{subreddit.display_name}.\n\nThe Flair Helper wiki page here: /r/{subreddit.display_name}/wiki/flair_helper exists but was currently blank.  I've went ahead and generated a working config based upon your 'Mod Only' flairs you have configured.  Otherwise, you can send me a PM with 'list' or 'auto' to generate a sample configuration.\n\n[Generate a List of Flairs](https://www.reddit.com/message/compose?to=/u/{bot_username}&subject=list&message={subreddit.display_name})\n\n[Auto-Generate a sample Flair Helper Config](https://www.reddit.com/message/compose?to=/u/{bot_username}&subject=auto&message={subreddit.display_name})\n\nYou can find more information in the Flair Helper documentation on /r/Flair_Helper2/wiki/tutorial/ \n\nHappy Flairing!"
                         subreddit_instance.message(subject, message)
-                        print(f"Sent PM to /r/{subreddit_name} moderators to create a Flair Helper configuration (wiki page exists but is blank)") if debugmode else None
+                        print(f"Sent PM to /r/{subreddit.display_name} moderators to create a Flair Helper configuration (wiki page exists but is blank)") if debugmode else None
                     else:
                         # Flair Helper wiki page exists and has content
-                        fetch_and_cache_configs(reddit, max_retries=2, retry_delay=5, single_sub=subreddit_name)
-                        print(f"Fetched and cached configuration for /r/{subreddit_name}") if debugmode else None
+                        fetch_and_cache_configs(reddit, max_retries=2, retry_delay=5, single_sub=subreddit.display_name)
+                        print(f"Fetched and cached configuration for /r/{subreddit.display_name}") if debugmode else None
                     break
 
                 except prawcore.exceptions.NotFound:
                     # Flair Helper wiki page doesn't exist
                     auto_gen_config = create_auto_flairhelper_wiki(reddit, subreddit, mode="wiki")
                     subreddit.wiki.create('flair_helper', auto_gen_config)
-                    print(f"Created auto_gen_config for 'flair_helper' wiki page for /r/{subreddit_name}") if debugmode else None
+                    print(f"Created auto_gen_config for 'flair_helper' wiki page for /r/{subreddit.display_name}") if debugmode else None
 
-                    subject = f"Flair Helper Configuration Needed for /r/{subreddit_name}"
-                    message = f"Hi! I noticed that I was recently added as a moderator to /r/{subreddit_name}. To use my Flair Helper features, please setup your configuration on the newly created 'flair_helper' wiki page here: /r/{subreddit_name}/wiki/flair_helper \n\nI've went ahead and generated a working config based upon your 'Mod Only' flairs you have configured.  Otherwise, you can send me a PM with 'list' or 'auto' to generate a sample configuration.\n\n[Generate a List of Flairs](https://www.reddit.com/message/compose?to=/u/{bot_username}&subject=list&message={subreddit_name})\n\n[Auto-Generate a sample Flair Helper Config](https://www.reddit.com/message/compose?to=/u/{bot_username}&subject=auto&message={subreddit_name})\n\nYou can find more information in the Flair Helper documentation on /r/Flair_Helper2/wiki/tutorial/ \n\nHappy Flairing!"
+                    subject = f"Flair Helper Configuration Needed for /r/{subreddit.display_name}"
+                    message = f"Hi! I noticed that I was recently added as a moderator to /r/{subreddit.display_name}. To use my Flair Helper features, please setup your configuration on the newly created 'flair_helper' wiki page here: /r/{subreddit.display_name}/wiki/flair_helper \n\nI've went ahead and generated a working config based upon your 'Mod Only' flairs you have configured.  Otherwise, you can send me a PM with 'list' or 'auto' to generate a sample configuration.\n\n[Generate a List of Flairs](https://www.reddit.com/message/compose?to=/u/{bot_username}&subject=list&message={subreddit.display_name})\n\n[Auto-Generate a sample Flair Helper Config](https://www.reddit.com/message/compose?to=/u/{bot_username}&subject=auto&message={subreddit.display_name})\n\nYou can find more information in the Flair Helper documentation on /r/Flair_Helper2/wiki/tutorial/ \n\nHappy Flairing!"
                     subreddit_instance.message(subject, message)
-                    print(f"Sent PM to /r/{subreddit_name} moderators to create a Flair Helper configuration (wiki page created)") if debugmode else None
+                    print(f"Sent PM to /r/{subreddit.display_name} moderators to create a Flair Helper configuration (wiki page created)") if debugmode else None
 
                 except praw.exceptions.RedditAPIException as e:
                     if e.error_type == "RATELIMIT":
@@ -713,16 +712,16 @@ def check_new_mod_invitations(reddit):
                         if wait_time_match:
                             wait_minutes = int(wait_time_match.group(1))
                             print(f"Rate limited. Waiting for {wait_minutes} minutes before retrying.") if debugmode else None
-                            discord_status_notification(f"check_new_mod_invitations Rate Limited for /r/{subreddit_name}.  Waiting for {wait_minutes} minutes before retrying.")
+                            discord_status_notification(f"check_new_mod_invitations Rate Limited for /r/{subreddit.display_name}.  Waiting for {wait_minutes} minutes before retrying.")
                             sleep(wait_minutes * 60 + retry_delay)
                             # After waiting, you might need to retry the operation that triggered the rate limit
                         else:
                             print("Rate limited, but could not extract wait time.") if debugmode else None
-                            discord_status_notification(f"check_new_mod_invitations Rate limited for /r/{subreddit_name}, but could not extract wait time.")
+                            discord_status_notification(f"check_new_mod_invitations Rate limited for /r/{subreddit.display_name}, but could not extract wait time.")
                             sleep(retry_delay)  # Wait for a default delay before retrying
 
                     else:
-                        error_handler(f"check_new_mod_invitations: Reddit API Exception in /r/{subreddit_name}: {e}", notify_discord=True)
+                        error_handler(f"check_new_mod_invitations: Reddit API Exception in /r/{subreddit.display_name}: {e}", notify_discord=True)
                         break
 
         sleep(3600)  # Check for new mod invitations every hour (adjust as needed)
@@ -766,19 +765,18 @@ def run_bot():
     with concurrent.futures.ThreadPoolExecutor() as flair_executor:
         flair_futures = []
         for subreddit in moderated_subreddits:
-            subreddit_name = subreddit.display_name
-            if f"u_{bot_username}" in subreddit_name:
-                print(f"Skipping bot's own user page: /r/{subreddit_name}") if debugmode else None
+            if f"u_{bot_username}" in subreddit.display_name:
+                print(f"Skipping bot's own user page: /r/{subreddit.display_name}") if debugmode else None
                 continue  # Skip the bot's own user page
 
-            config = get_cached_config(subreddit_name)
+            config = get_cached_config(subreddit.display_name)
 
             if config:
-                print(f"Valid Config Exists for /r/{subreddit_name}.  Flair Helper 2 Active.")
+                print(f"Valid Config Exists for /r/{subreddit.display_name}.  Flair Helper 2 Active.")
                 future = flair_executor.submit(monitor_mod_log, subreddit, config)
                 flair_futures.append(future)
             else:
-                print(f"No Flair Helper configuration found for /r/{subreddit_name}")
+                print(f"No Flair Helper configuration found for /r/{subreddit.display_name}")
 
         # Wait for all the flair-related futures to complete
         concurrent.futures.wait(flair_futures)
