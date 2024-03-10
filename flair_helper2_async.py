@@ -423,13 +423,6 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit):
                 return
             post._last_flair_time = time.time()
 
-            for placeholder, value in placeholders.items():
-                formatted_header = formatted_header.replace(f"{{{{{placeholder}}}}}", str(value))
-                formatted_flair_details = flair_details.replace(f"{{{{{placeholder}}}}}", str(value))
-                formatted_footer = formatted_footer.replace(f"{{{{{placeholder}}}}}", str(value))
-
-            removal_reason = f"{formatted_header}\n\n{formatted_flair_details}\n\n{formatted_footer}"
-
             utc_offset = config.get('utc_offset', 0)
             custom_time_format = config.get('custom_time_format', '')
 
@@ -471,6 +464,13 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit):
                 'author_id': author_id,
                 'subreddit_id': post.subreddit.id
             })
+
+            for placeholder, value in placeholders.items():
+                formatted_header = formatted_header.replace(f"{{{{{placeholder}}}}}", str(value))
+                formatted_flair_details = flair_details.replace(f"{{{{{placeholder}}}}}", str(value))
+                formatted_footer = formatted_footer.replace(f"{{{{{placeholder}}}}}", str(value))
+
+            removal_reason = f"{formatted_header}\n\n{formatted_flair_details}\n\n{formatted_footer}"
 
 
             # Execute the configured actions
