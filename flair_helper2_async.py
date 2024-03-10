@@ -23,7 +23,7 @@ verbosemode = False
 
 auto_accept_mod_invites = False
 
-discord_bot_notifications = True
+discord_bot_notifications = False
 discord_webhook_url = "YOUR_DISCORD_WEBHOOK_URL"
 
 logs_dir = "logs/"
@@ -149,7 +149,8 @@ async def fetch_and_cache_configs(reddit, max_retries=2, retry_delay=5, single_s
                     # The rest of your code to handle the wiki content goes here
                 except Exception as e:
                     # Handle exceptions appropriately
-                    print(f"Error accessing wiki page: {e}")
+                    await error_handler(f"Error accessing the /r/{subreddit_name} flair_helper wiki page: {e}", notify_discord=True)
+
 
                 if not wiki_content:
                     print(f"Flair Helper configuration for /r/{subreddit_name} is blank. Skipping...") if debugmode else None
@@ -177,7 +178,7 @@ async def fetch_and_cache_configs(reddit, max_retries=2, retry_delay=5, single_s
                         try:
                             yaml.load(wiki_content, Loader=yaml.FullLoader)
                             await cache_config(subreddit_name, updated_config)
-                            print(f"The Flair Helper wiki page configuration for /r/{subreddit_name} has been successfully reloaded.") if debugmode else None
+                            await error_handler(f"The Flair Helper wiki page configuration for /r/{subreddit_name} has been successfully cached and reloaded.", notify_discord=True)
 
                             # Add a short delay before sending the message
                             await asyncio.sleep(2)  # Adjust the delay as needed
@@ -718,20 +719,22 @@ async def create_auto_flairhelper_wiki(reddit, subreddit, mode):
     yaml_output = yaml.dump(config, sort_keys=False, allow_unicode=True, width=float("inf"))
 
     if mode == "pm":
-        response = f"Here's a sample Flair Helper 2 configuration for /r/{subreddit_name} which you can place in [https://www.reddit.com/r/{subreddit_name}/wiki/flair_helper](https://www.reddit.com/r/{subreddit_name}/wiki/flair_helper)\n\n"
-        response += yaml_output
-        response += "\n\nPlease be sure to review all the detected flairs and remove any that may not be applicable (such as Mod Announcements, Notices, News, etc.)"
+        formatted_yaml_output = "    " + yaml_output.replace("\n", "\n    ")
+
+        final_output = f"Here's a sample Flair Helper 2 configuration for /r/{subreddit.display_name} which you can place in [https://www.reddit.com/r/{subreddit.display_name}/wiki/flair_helper](https://www.reddit.com/r/{subreddit.display_name}/wiki/flair_helper)\n\nBy default all options are set to 'false' if you wish to enable that specific action for a particular flair, change it to 'true'"
+        final_output += comment + formatted_yaml_output
+        final_output += "\n\nPlease be sure to review all the detected flairs and remove any that may not be applicable (such as Mod Announcements, Notices, News, etc.)"
 
         # Implement the 10,000 character limit on the complete response for private messages
-        while len(response) > 10000:
-            print(f"Response length > 10000 and is currently {len(response)}, removing extra entries") if debugmode else None
+        while len(final_output) > 10000:  # Use final_output instead of response
+            print(f"Response length > 10000 and is currently {len(final_output)}, removing extra entries") if debugmode else None
 
             # Get the list of flair IDs
             flair_ids = list(config['flairs'].keys())
 
             # Check if the response exceeds the 10k character limit
-            while len(response) > 10000:
-                print(f"Response length > 10000 and is currently {len(response)}, removing extra entries") if debugmode else None
+            while len(final_output) > 10000:  # Use final_output instead of response
+                print(f"Response length > 10000 and is currently {len(final_output)}, removing extra entries") if debugmode else None
 
                 # Get the list of flair IDs from the action sections
                 action_flair_ids = list(config['remove'].keys())
@@ -759,11 +762,9 @@ async def create_auto_flairhelper_wiki(reddit, subreddit, mode):
                 yaml_output = yaml.dump(config, sort_keys=False, allow_unicode=True, width=float("inf"))
                 formatted_yaml_output = "    " + yaml_output.replace("\n", "\n    ")
 
-                response = f"Here's a sample Flair Helper 2 configuration for /r/{subreddit_name} which you can place in [https://www.reddit.com/r/{subreddit_name}/wiki/flair_helper](https://www.reddit.com/r/{subreddit_name}/wiki/flair_helper)\n\nBy default all options are set to 'false' if you wish to enable that specific action for a particular flair, change it to 'true'"
-                response += comment + formatted_yaml_output
-                response += "\n\nPlease be sure to review all the detected flairs and remove any that may not be applicable (such as Mod Announcements, Notices, News, etc.)"
-
-                final_output = response
+                final_output = f"Here's a sample Flair Helper 2 configuration for /r/{subreddit.display_name} which you can place in [https://www.reddit.com/r/{subreddit.display_name}/wiki/flair_helper](https://www.reddit.com/r/{subreddit.display_name}/wiki/flair_helper)\n\nBy default all options are set to 'false' if you wish to enable that specific action for a particular flair, change it to 'true'"
+                final_output += comment + formatted_yaml_output
+                final_output += "\n\nPlease be sure to review all the detected flairs and remove any that may not be applicable (such as Mod Announcements, Notices, News, etc.)"
 
     elif mode == "wiki":
         final_output = comment + yaml_output
