@@ -18,7 +18,7 @@ from asyncprawcore import ResponseException
 from asyncprawcore import NotFound
 from discord_webhook import DiscordWebhook, DiscordEmbed
 
-debugmode = True
+debugmode = False
 verbosemode = False
 
 auto_accept_mod_invites = False
