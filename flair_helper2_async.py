@@ -800,7 +800,7 @@ async def check_new_mod_invitations(reddit, bot_username):
 
         for subreddit in new_subreddits:
             if f"u_{bot_username}" in subreddit.display_name:
-                print(f"{current_utc_timestamp}: Skipping bot's own user page: /r/{subreddit.display_name}") if debugmode else None
+                #print(f"{current_utc_timestamp}: check_new_mod_invitations: Skipping bot's own user page: /r/{subreddit.display_name}") if debugmode else None
                 continue  # Skip the bot's own user page
 
             subreddit_instance = await get_subreddit(reddit, subreddit.display_name)
@@ -825,7 +825,7 @@ async def check_new_mod_invitations(reddit, bot_username):
                         print(f"{current_utc_timestamp}: Sent PM to /r/{subreddit.display_name} moderators to create a Flair Helper configuration (wiki page exists but is blank)") if debugmode else None
                     else:
                         # Flair Helper wiki page exists and has content
-                        await fetch_and_cache_configs(reddit, bot_username, max_retries=2, retry_delay=5, single_sub=subreddit.display_name)
+                        await fetch_and_cache_configs(reddit, bot_username, max_retries=3, retry_delay=5, single_sub=subreddit.display_name)
                         print(f"{current_utc_timestamp}: Fetched and cached configuration for /r/{subreddit.display_name}") if debugmode else None
                     break
 
@@ -863,33 +863,38 @@ async def check_new_mod_invitations(reddit, bot_username):
 
 
 # Primary Mod Log Monitor
-async def monitor_mod_log(reddit, subreddit, config, bot_username):
+async def monitor_mod_log(reddit, bot_username):
     current_utc_timestamp = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
     accounts_to_ignore = ['AssistantBOT1', 'anyadditionalacctshere', 'thatmayinteractwithflair']
+
     try:
+        subreddit = await reddit.subreddit("mod")
         async for log_entry in subreddit.mod.stream.log(skip_existing=True):
             print(f"{current_utc_timestamp}: New log entry: {log_entry.action}") if verbosemode else None
+
             if log_entry.action == 'wikirevise':
                 if 'flair_helper' in log_entry.details:
                     print(f"{current_utc_timestamp}: Flair Helper wiki page revised by {log_entry.mod} in /r/{log_entry.subreddit}") if debugmode else None
                     try:
-                        await fetch_and_cache_configs(reddit, bot_username, max_retries=2, retry_delay=5, single_sub=subreddit.display_name)  # Make sure fetch_and_cache_configs is async
+                        await fetch_and_cache_configs(reddit, bot_username, max_retries=3, retry_delay=5, single_sub=log_entry.subreddit)  # Make sure fetch_and_cache_configs is async
                     except asyncprawcore.exceptions.NotFound:
-                        error_output = f"monitor_mod_log: Flair Helper wiki page not found in /r/{subreddit.display_name}"
+                        error_output = f"monitor_mod_log: Flair Helper wiki page not found in /r/{log_entry.subreddit}"
                         print(error_output) if debugmode else None
                         errors_logger.error(error_output)
             elif (log_entry.action == 'editflair'
-              and log_entry.mod not in accounts_to_ignore
-              and log_entry.target_fullname.startswith('t3_')):
+                and log_entry.mod not in accounts_to_ignore
+                and log_entry.target_fullname.startswith('t3_')):
                 # This is a link (submission) flair edit
                 if log_entry.target_fullname:
                     # Get the post object
                     print(f"{current_utc_timestamp}: Flair action detected by {log_entry.mod} in /r/{log_entry.subreddit}") if debugmode else None
-                    await process_flair_assignment(reddit, log_entry, config, subreddit)  # Ensure process_flair_assignment is also async
+                    subreddit_instance = await reddit.subreddit(log_entry.subreddit)
+                    config = get_cached_config(log_entry.subreddit)
+                    await process_flair_assignment(reddit, log_entry, config, subreddit_instance)  # Ensure process_flair_assignment is also async
                 else:
                     print(f"{current_utc_timestamp}: No target found") if debugmode else None
             else:
-                print(f"{current_utc_timestamp}: Ignoring action: {log_entry.action} in /r/{subreddit.display_name}") if verbosemode else None
+                print(f"{current_utc_timestamp}: Ignoring action: {log_entry.action} in /r/{log_entry.subreddit}") if verbosemode else None
     except asyncpraw.exceptions.RedditAPIException as e:
         if e.error_type == "RATELIMIT":
             wait_time_match = re.search(r"for (\d+) minute", e.message)
@@ -902,33 +907,14 @@ async def monitor_mod_log(reddit, subreddit, config, bot_username):
                 print("Rate limited, but could not extract wait time.")
                 await asyncio.sleep(60)  # Wait for a default duration before retrying
         else:
-            await error_handler(f"monitor_mod_log: Error in /r/{subreddit.display_name}: {e}", notify_discord=True)
+            await error_handler(f"monitor_mod_log: Error: {e}", notify_discord=True)
 
 
 
-# Create Multithreaded Instance to monitor all subs that have a valid Flair_Helper configuration
 async def run_bot_async(reddit, bot_username):
     # Correctly await the asynchronous function call
     await fetch_and_cache_configs(reddit, bot_username)  # This is adapted to be async
-
-    tasks = []
-    async for subreddit in reddit.user.moderator_subreddits():
-        if f"u_{bot_username}" in subreddit.display_name:
-            print(f"Skipping bot's own user page: /r/{subreddit.display_name}") if debugmode else None
-            continue  # Skip the bot's own user page
-
-        subreddit_instance = await get_subreddit(reddit, subreddit.display_name)
-        config = get_cached_config(subreddit.display_name)
-
-        if config:
-            print(f"Valid Config Exists for /r/{subreddit.display_name}.  Flair Helper 2 Active.")
-            task = asyncio.create_task(monitor_mod_log(reddit, subreddit_instance, config, bot_username))
-            tasks.append(task)
-        else:
-            print(f"No Flair Helper configuration found for /r/{subreddit.display_name}")
-
-    if tasks:
-        await asyncio.gather(*tasks)
+    await monitor_mod_log(reddit, bot_username)
 
 
 # Check for PM's every 60 seconds
@@ -939,23 +925,41 @@ async def monitor_private_messages(reddit):
 
 
 async def main():
-    async with aiohttp.ClientSession() as session:
-        reddit = asyncpraw.Reddit("fh2_login", requestor_kwargs={"session": session})
+    max_retries = 3
+    retry_delay = 30  # Delay in seconds between retries
 
-       # Fetch the bot's username
-        me = await reddit.user.me()
-        bot_username = me.name
+    for attempt in range(max_retries):
+        try:
+            async with aiohttp.ClientSession() as session:
+                reddit = asyncpraw.Reddit("fh2_login", requestor_kwargs={"session": session})
 
-        print(f"Flair Helper 2 has started up successfully!\nBot username: {bot_username}")
-        await discord_status_notification(f"Flair Helper 2 has started up successfully!\nBot username: {bot_username}")
+                # Fetch the bot's username
+                me = await reddit.user.me()
+                bot_username = me.name
 
-        # Create separate tasks for run_bot_async and monitor_private_messages
-        bot_task = asyncio.create_task(run_bot_async(reddit, bot_username))
-        pm_task = asyncio.create_task(monitor_private_messages(reddit))
-        mod_invites_task = asyncio.create_task(check_new_mod_invitations(reddit, bot_username))
+                print(f"Flair Helper 2 has started up successfully!\nBot username: {bot_username}")
+                await discord_status_notification(f"Flair Helper 2 has started up successfully!\nBot username: {bot_username}")
 
-        # Run both tasks concurrently using asyncio.gather
-        await asyncio.gather(bot_task, pm_task, mod_invites_task)
+                # Create separate tasks for run_bot_async and monitor_private_messages
+                bot_task = asyncio.create_task(run_bot_async(reddit, bot_username))
+                pm_task = asyncio.create_task(monitor_private_messages(reddit))
+                mod_invites_task = asyncio.create_task(check_new_mod_invitations(reddit, bot_username))
+
+                # Run tasks concurrently using asyncio.gather
+                await asyncio.gather(bot_task, pm_task, mod_invites_task)
+
+            # If the bot starts successfully, break out of the retry loop
+            break
+
+        except asyncprawcore.exceptions.RequestException as e:
+            print(f"Error connecting to Reddit API: {str(e)}")
+            if attempt < max_retries - 1:
+                print(f"Retrying in {retry_delay} seconds...")
+                await asyncio.sleep(retry_delay)
+            else:
+                print("Max retries exceeded. Exiting...")
+                raise
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
