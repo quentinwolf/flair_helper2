@@ -50,7 +50,7 @@ Replace `YOUR_CLIENT_ID`, `YOUR_CLIENT_SECRET`, `YOUR_REFRESH_TOKEN`, and `YOUR_
 python flair_helper2_async.py
 ```
 
-I initially started off with a non-async version, although found I'd occasionally run into some oddities, so I began converting it over to an asynchronous version.  The old one has mostly been updated with all the same features, although could use further development.
+I initially started off with the non-async version, although found I'd occasionally run into some oddities, so I began converting it over to an asynchronous version.  The old one has mostly been updated with all the same features, although could use further development, and at the current point I've stopped adding features to it as the async version is far superior as it utilizes a single mod log stream to monitor all moderated subs for flair changes vs spawning an individual thread per-sub (which doesn't scale as well if you have more than 15 subs or so).  The async one should technically be good up to a hundred or so subs, depending on how active the subs are due to API limitations of 600 calls every 10 minutes.
 
 ## Contributing
 
