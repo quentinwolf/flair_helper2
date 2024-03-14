@@ -22,6 +22,7 @@ debugmode = False
 verbosemode = False
 
 auto_accept_mod_invites = False
+send_pm_on_wiki_config_update = False
 
 discord_bot_notifications = False
 discord_webhook_url = "YOUR_DISCORD_WEBHOOK_URL"
