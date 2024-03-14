@@ -31,10 +31,10 @@ def main():
         client_id=client_id.strip(),
         client_secret=client_secret.strip(),
         redirect_uri="http://localhost:8080",
-        user_agent=f"praw_refresh_token_generator/v0.0.1 by u/quentinwolf",
+        user_agent=f"praw_refresh_token_generator/v0.0.1 by YourUsername",
     )
     state = str(random.randint(0, 65000))
-    url = reddit.auth.url(scopes, state, "permanent")
+    url = reddit.auth.url(scopes=scopes, state=state, duration="permanent")
     print(f"Go to this URL: {url}")
     webbrowser.open(url)
 
@@ -45,11 +45,17 @@ def main():
         key: value for (key, value) in [token.split("=") for token in param_tokens]
     }
 
+    if "state" not in params:
+        send_message(client, "State parameter not found in the response.")
+        print("Authentication process was interrupted. Please try again.")
+        sys.exit(1)
+
     if state != params["state"]:
         send_message(
             client,
             f"State mismatch. Expected: {state} Received: {params['state']}",
         )
+        print("State mismatch. Authentication process was interrupted. Please try again.")
         sys.exit(1)
 
     refresh_token = reddit.auth.authorize(params["code"])
