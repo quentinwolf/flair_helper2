@@ -12,6 +12,7 @@ import base64
 import json
 import logging
 import os
+import traceback
 import concurrent.futures
 from logging.handlers import TimedRotatingFileHandler
 from asyncprawcore import ResponseException
@@ -142,6 +143,22 @@ def convert_yaml_to_json(yaml_config):
     # Convert the YAML configuration to JSON format
     json_config = [general_config]
     for flair_id, flair_details in yaml_config.get('flairs', {}).items():
+        # Remove special characters except dashes, underscores, periods, and commas
+        cleaned_mod_note = re.sub(r'[^a-zA-Z0-9\s\-_.,]', '', yaml_config.get('ban_note', {}).get(flair_id, ''))
+
+        # Truncate the mod_note to 250 characters
+        cleaned_mod_note = cleaned_mod_note[:250]
+
+        # Remove special characters except dashes, underscores, periods, and commas
+        cleaned_modlog_reason = re.sub(r'[^a-zA-Z0-9\s\-_.,/\\]', '', yaml_config.get('ban', {}).get(flair_id, ''))
+        cleaned_modlog_reason = cleaned_modlog_reason.replace('\n', ' ')
+        cleaned_modlog_reason = cleaned_modlog_reason.replace('  ', ' ')
+        cleaned_modlog_reason = cleaned_modlog_reason.replace('  ', ', ')
+        cleaned_modlog_reason = cleaned_modlog_reason.strip()
+
+        # Truncate the modlog_reason to 250 characters
+        cleaned_modlog_reason = cleaned_modlog_reason[:250]
+
         flair_config = {
             "templateId": flair_id,
             "notes": flair_details,
@@ -150,6 +167,7 @@ def convert_yaml_to_json(yaml_config):
             "lock": flair_id in yaml_config.get('lock_post', {}),
             "spoiler": flair_id in yaml_config.get('spoiler_post', {}),
             "clearPostFlair": flair_id in yaml_config.get('remove_link_flair', {}),
+            "modlogReason": cleaned_modlog_reason,
             "comment": {
                 "enabled": flair_id in yaml_config.get('comment', {}),
                 "body": flair_details,
@@ -176,10 +194,10 @@ def convert_yaml_to_json(yaml_config):
                 "enabled": flair_id in yaml_config.get('bans', {}),
                 "duration": "" if yaml_config.get('bans', {}).get(flair_id, 0) is True else yaml_config.get('bans', {}).get(flair_id, 0),
                 "message": yaml_config.get('ban_message', {}).get(flair_id, ''),
-                "modNote": yaml_config.get('ban_note', {}).get(flair_id, '')
+                "modNote": cleaned_mod_note
             },
             "unban": flair_id in yaml_config.get('unbans', {}),
-            "sendToWebhook": flair_id in yaml_config.get('send_to_webhook', []),
+            "sendToWebhook": flair_id in yaml_config.get('send_to_webhook', [])
         }
 
         json_config.append(flair_config)
@@ -320,9 +338,10 @@ async def fetch_and_cache_configs(reddit, bot_username, max_retries=3, retry_del
                                 await error_handler(f"Error sending message to /r/{subreddit.display_name}: {e}", notify_discord=True)
                 else:
                     print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: The Flair Helper wiki page configuration for /r/{subreddit.display_name} has not changed.") if debugmode else None
+                    await asyncio.sleep(1)  # Adjust the delay as needed
                 break  # Configuration loaded successfully, exit the retry loop
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                print(f"Error connecting to Reddit API: {str(e)}")
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: fetch_and_cache_configs: Error connecting to Reddit API: {str(e)}")
                 retries += 1
                 if retries < max_retries:
                     print(f"Retrying in {retry_delay} seconds...")
@@ -508,7 +527,7 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit, max_ret
                 break
 
             except asyncprawcore.exceptions.RequestException as e:
-                print(f"Error connecting to Reddit API: {str(e)}") if debugmode else None
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment: Error connecting to Reddit API: {str(e)}") if debugmode else None
                 if attempt < max_retries - 1:
                     print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
                     await asyncio.sleep(retry_delay)
@@ -553,7 +572,7 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit, max_ret
                     break
 
                 except asyncprawcore.exceptions.RequestException as e:
-                    print(f"Error connecting to Reddit API: {str(e)}") if debugmode else None
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment attempt: Error connecting to Reddit API: {str(e)}") if debugmode else None
                     if attempt < max_retries - 1:
                         print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
                         await asyncio.sleep(retry_delay)
@@ -654,7 +673,7 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit, max_ret
                         await post.mod.unspoiler()
                         break
                     except asyncprawcore.exceptions.RequestException as e:
-                        print(f"Error connecting to Reddit API: {str(e)}") if debugmode else None
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment approve: Error connecting to Reddit API: {str(e)}") if debugmode else None
                         if attempt < max_retries - 1:
                             print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
                             await asyncio.sleep(retry_delay)
@@ -667,16 +686,35 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit, max_ret
                     try:
                         print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: remove triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
                         mod_note = flair_details['usernote']['note'] if 'usernote' in flair_details and flair_details['usernote']['enabled'] else ''
+
+                        if flair_details.get('modlogReason'):
+                            mod_note = flair_details['modlogReason']
+
                         await post.mod.remove(spam=False, mod_note=mod_note)
                         break
                     except asyncprawcore.exceptions.RequestException as e:
-                        print(f"Error connecting to Reddit API: {str(e)}") if debugmode else None
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment remove: Error connecting to Reddit API: {str(e)}") if debugmode else None
                         if attempt < max_retries - 1:
                             print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
                             await asyncio.sleep(retry_delay)
                         else:
                             print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Skipping remove action...") if debugmode else None
                             await error_handler(f"process_flair_assignment: Error Removing Post ID: {submission_id} in /r/{subreddit.display_name}: {e}", notify_discord=True)
+
+            if not flair_details.get('remove') and flair_details.get('modlogReason'):
+                for attempt in range(max_retries):
+                    try:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: modlogReason triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
+                        await post.mod.create_note(note=flair_details['modlogReason'])  # Remove the 'label' parameter
+                        break
+                    except asyncprawcore.exceptions.RequestException as e:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment remove_modlogreason: Error connecting to Reddit API: {str(e)}") if debugmode else None
+                        if attempt < max_retries - 1:
+                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
+                            await asyncio.sleep(retry_delay)
+                        else:
+                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Skipping create_note action...") if debugmode else None
+                            await error_handler(f"process_flair_assignment: Error Creating Mod Note for ID: {submission_id} in /r/{subreddit.display_name}: {e}", notify_discord=True)
 
             if 'comment' in flair_details and flair_details['comment']['enabled']:
                 post_age_days = (datetime.utcnow() - datetime.utcfromtimestamp(post.created_utc)).days
@@ -699,7 +737,7 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit, max_ret
                                     await comment.mod.lock()
                             break
                         except asyncprawcore.exceptions.RequestException as e:
-                            print(f"Error connecting to Reddit API: {str(e)}") if debugmode else None
+                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment comment: Error connecting to Reddit API: {str(e)}") if debugmode else None
                             if attempt < max_retries - 1:
                                 print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
                                 await asyncio.sleep(retry_delay)
@@ -715,7 +753,7 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit, max_ret
                         await post.mod.lock()
                         break
                     except asyncprawcore.exceptions.RequestException as e:
-                        print(f"Error connecting to Reddit API: {str(e)}") if debugmode else None
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment lock: Error connecting to Reddit API: {str(e)}") if debugmode else None
                         if attempt < max_retries - 1:
                             print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
                             await asyncio.sleep(retry_delay)
@@ -731,7 +769,7 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit, max_ret
                         await post.mod.spoiler()
                         break
                     except asyncprawcore.exceptions.RequestException as e:
-                        print(f"Error connecting to Reddit API: {str(e)}") if debugmode else None
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment spoiler: Error connecting to Reddit API: {str(e)}") if debugmode else None
                         if attempt < max_retries - 1:
                             print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
                             await asyncio.sleep(retry_delay)
@@ -746,7 +784,7 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit, max_ret
                         await post.mod.flair(text='', css_class='')
                         break
                     except asyncprawcore.exceptions.RequestException as e:
-                        print(f"Error connecting to Reddit API: {str(e)}") if debugmode else None
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment clearPostFlair: Error connecting to Reddit API: {str(e)}") if debugmode else None
                         if attempt < max_retries - 1:
                             print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
                             await asyncio.sleep(retry_delay)
@@ -790,7 +828,7 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit, max_ret
                                 print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: banning not triggered on ID: {submission_id} for flair GUID: {flair_details['templateId']} in /r/{subreddit.display_name}") if debugmode else None
                             break
                         except asyncprawcore.exceptions.RequestException as e:
-                            print(f"Error connecting to Reddit API: {str(e)}") if debugmode else None
+                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment ban: Error connecting to Reddit API: {str(e)}") if debugmode else None
                             if attempt < max_retries - 1:
                                 print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
                                 await asyncio.sleep(retry_delay)
@@ -805,7 +843,7 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit, max_ret
                             await subreddit.banned.remove(post.author)
                             break
                         except asyncprawcore.exceptions.RequestException as e:
-                            print(f"Error connecting to Reddit API: {str(e)}") if debugmode else None
+                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment unban: Error connecting to Reddit API: {str(e)}") if debugmode else None
                             if attempt < max_retries - 1:
                                 print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
                                 await asyncio.sleep(retry_delay)
@@ -838,7 +876,7 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit, max_ret
                             print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: {debug_current_Flair} Updated to text='{flair_text}', css_class='{flair_css_class}'") if debugmode else None
                             break
                         except asyncprawcore.exceptions.RequestException as e:
-                            print(f"Error connecting to Reddit API: {str(e)}")
+                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment userFlair: Error connecting to Reddit API: {str(e)}")
                             if attempt < max_retries - 1:
                                 print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...")
                                 await asyncio.sleep(retry_delay)
@@ -864,7 +902,7 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit, max_ret
                             await subreddit.contributor.add(post.author)
                             break
                         except asyncprawcore.exceptions.RequestException as e:
-                            print(f"Error connecting to Reddit API: {str(e)}") if debugmode else None
+                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment usernote: Error connecting to Reddit API: {str(e)}") if debugmode else None
                             if attempt < max_retries - 1:
                                 print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
                                 await asyncio.sleep(retry_delay)
@@ -879,7 +917,7 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit, max_ret
                             await subreddit.contributor.remove(post.author)
                             break
                         except asyncprawcore.exceptions.RequestException as e:
-                            print(f"Error connecting to Reddit API: {str(e)}") if debugmode else None
+                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment contributor: Error connecting to Reddit API: {str(e)}") if debugmode else None
                             if attempt < max_retries - 1:
                                 print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
                                 await asyncio.sleep(retry_delay)
@@ -904,7 +942,7 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit, max_ret
                                     print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Removed comment {comment.id} under Post ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
                                     break
                                 except asyncprawcore.exceptions.RequestException as e:
-                                    print(f"Error removing comment {str(e)}") if debugmode else None
+                                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment nukeUserComments: Error removing comment {str(e)}") if debugmode else None
                                     if attempt < max_retries - 1:
                                         print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
                                         await asyncio.sleep(retry_delay)
@@ -915,7 +953,7 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit, max_ret
                     print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Finished nuking comments under Post ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
 
                 except asyncprawcore.exceptions.RequestException as e:
-                    error_message = f"Error fetching comments for post ID: {submission_id} in /r/{subreddit.display_name}: {str(e)}"
+                    error_message = f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment nukeUserComments: Error fetching comments for post ID: {submission_id} in /r/{subreddit.display_name}: {str(e)}"
                     print(error_message) if debugmode else None
                     await error_handler(error_message, notify_discord=True)
                     # Handle the error, e.g., retry or log the error
@@ -1162,6 +1200,7 @@ async def check_new_mod_invitations(reddit, bot_username):
 
                     else:
                         await error_handler(f"check_new_mod_invitations: Reddit API Exception in /r/{subreddit.display_name}: {e}", notify_discord=True)
+                        traceback.print_exc()  # Print the full traceback
                         break
 
 
@@ -1211,6 +1250,7 @@ async def monitor_mod_log(reddit, bot_username):
                 await asyncio.sleep(60)  # Wait for a default duration before retrying
         else:
             await error_handler(f"monitor_mod_log: Error: {e}", notify_discord=True)
+            traceback.print_exc()  # Print the full traceback
 
 
 
@@ -1235,36 +1275,37 @@ async def main():
 
     for attempt in range(max_retries):
         try:
-            async with aiohttp.ClientSession() as session:
-                reddit = asyncpraw.Reddit("fh2_login", requestor_kwargs={"session": session})
+            reddit = asyncpraw.Reddit("fh2_login")
 
-                # Fetch the bot's username
-                me = await reddit.user.me()
-                bot_username = me.name
+            # Fetch the bot's username
+            me = await reddit.user.me()
+            bot_username = me.name
 
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair Helper 2 has started up successfully!\nBot username: {bot_username}")
-                await discord_status_notification(f"Flair Helper 2 has started up successfully!\nBot username: {bot_username}")
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair Helper 2 has started up successfully!\nBot username: {bot_username}")
+            await discord_status_notification(f"Flair Helper 2 has started up successfully!\nBot username: {bot_username}")
 
-                # Create separate tasks for run_bot_async and monitor_private_messages
-                bot_task = asyncio.create_task(run_bot_async(reddit, bot_username))
-                pm_task = asyncio.create_task(monitor_private_messages(reddit))
-                mod_invites_task = asyncio.create_task(check_new_mod_invitations(reddit, bot_username))
+            # Create separate tasks for each coroutine
+            bot_task = asyncio.create_task(run_bot_async(reddit, bot_username))
+            pm_task = asyncio.create_task(monitor_private_messages(reddit))
+            mod_invites_task = asyncio.create_task(check_new_mod_invitations(reddit, bot_username))
 
-                # Run tasks concurrently using asyncio.gather
-                await asyncio.gather(bot_task, pm_task, mod_invites_task)
+            await asyncio.gather(bot_task, pm_task, mod_invites_task)
 
             # If the bot starts successfully, break out of the retry loop
             break
 
-        except asyncprawcore.exceptions.RequestException as e:
-            print(f"Error connecting to Reddit API: {str(e)}")
+        except (aiohttp.ClientConnectorError, asyncprawcore.exceptions.RequestException) as e:
+            error_message = f"main(): Error connecting to Reddit API: {str(e)}"
+            print(error_message)
+            await error_handler(error_message, notify_discord=True)
+
             if attempt < max_retries - 1:
-                print(f"Retrying in {retry_delay} seconds...")
+                retry_delay = min(retry_delay * 2, max_retry_delay)  # Exponential backoff
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...")
                 await asyncio.sleep(retry_delay)
             else:
-                print("Max retries exceeded. Exiting...")
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Exiting...")
                 raise
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
