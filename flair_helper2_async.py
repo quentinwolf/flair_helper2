@@ -726,7 +726,11 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit, max_ret
                         try:
                             if flair_details['remove']:
                                 # If both 'remove' and 'comment' are configured for the flair GUID
-                                removal_type = config[0]['GeneralConfiguration'].get('removal_comment_type', 'public_as_subreddit')
+                                removal_type = config[0]['GeneralConfiguration'].get('removal_comment_type', '')
+                                if removal_type == '':
+                                    removal_type = 'public_as_subreddit'  # Default to 'public' if removal_comment_type is blank or unset
+                                elif removal_type not in ['public', 'private', 'private_exposed', 'public_as_subreddit']:
+                                    removal_type = 'public_as_subreddit'  # Use 'public' as the default if an invalid value is provided
                                 await post.mod.send_removal_message(message=removal_reason, type=removal_type)
                             else:
                                 # If only 'comment' is configured for the flair GUID
