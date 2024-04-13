@@ -49,22 +49,11 @@ async def error_handler(error_message, notify_discord=False):
         await discord_status_notification(error_message)
 
 
-subreddit_cache = {}
-
-def populate_subreddit_cache_from_db():
-    subreddits = get_stored_subreddits()
-    for subreddit_name in subreddits:
-        subreddit_cache[subreddit_name] = subreddit_name
-
 async def get_subreddit(reddit, subreddit_name):
-    if subreddit_name in subreddit_cache:
-        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: get_subreddit: subreddit_name in subreddit_cache: subreddit_name: {subreddit_name}") if debugmode else None
-        return subreddit_cache[subreddit_name]
-    else:
-        subreddit = await reddit.subreddit(subreddit_name)
-        subreddit_cache[subreddit_name] = subreddit
-        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: get_subreddit: subreddit_name NOT in subreddit_cache: subreddit_name: {subreddit_name}, subreddit: {subreddit}") if debugmode else None
-        return subreddit
+    subreddit = await reddit.subreddit(subreddit_name)
+    #subreddit_cache[subreddit_name] = subreddit
+    #print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: get_subreddit: subreddit_name NOT in subreddit_cache: subreddit_name: {subreddit_name}, subreddit: {subreddit}") if debugmode else None
+    return subreddit
 
 
 # Create local sqlite db to cache/store Wiki Configs for all subs ones bot moderates
@@ -106,6 +95,22 @@ def get_stored_subreddits():
     stored_subreddits = [row[0] for row in c.fetchall()]
     conn.close()
     return stored_subreddits
+
+
+def is_database_empty():
+    conn = sqlite3.connect('flair_helper_configs.db')
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='configs'")
+    table_exists = c.fetchone()[0]
+    if table_exists:
+        c.execute("SELECT COUNT(*) FROM configs")
+        count = c.fetchone()[0]
+        conn.close()
+        return count == 0
+    else:
+        conn.close()
+        return True
+
 
 async def get_latest_wiki_revision(subreddit):
     try:
@@ -238,7 +243,24 @@ async def check_mod_permissions(subreddit, mod_name):
     return None
 
 
+def validate_and_correct_config(config):
+    corrected_config = []
 
+    for item in config:
+        if isinstance(item, dict):
+            corrected_item = {}
+            for key, value in item.items():
+                if isinstance(value, str):
+                    # Replace newline characters with '\n'
+                    value = value.replace("\n", "\\n")
+                corrected_item[key] = value
+            corrected_config.append(corrected_item)
+        else:
+            corrected_config.append(item)
+
+    return corrected_config
+
+    
 async def fetch_and_cache_configs(reddit, bot_username, max_retries=3, retry_delay=1, max_retry_delay=60, single_sub=None):
     create_database()
     moderated_subreddits = []
@@ -278,9 +300,6 @@ async def fetch_and_cache_configs(reddit, bot_username, max_retries=3, retry_del
                         updated_config = yaml.safe_load(wiki_content)
                         # Convert the YAML configuration to JSON format
                         updated_config = convert_yaml_to_json(updated_config)
-                        # Save the JSON configuration back to the wiki page
-                        wiki_page = await subreddit.wiki.get_page('flair_helper')
-                        await wiki_page.edit(content=json.dumps(updated_config, indent=4))
                     except yaml.YAMLError:
                         # If both JSON and YAML parsing fail, send a notification to the subreddit
                         subject = f"Flair Helper Configuration Error in /r/{subreddit.display_name}"
@@ -295,6 +314,9 @@ async def fetch_and_cache_configs(reddit, bot_username, max_retries=3, retry_del
                         if send_pm_on_wiki_config_update:
                             await subreddit.message(subject, message)
                         raise ValueError(f"Unsupported or invalid configuration format for /r/{subreddit.display_name}")
+
+                # Perform validation and automatic correction
+                updated_config = validate_and_correct_config(updated_config)
 
                 cached_config = get_cached_config(subreddit.display_name)
 
@@ -318,6 +340,9 @@ async def fetch_and_cache_configs(reddit, bot_username, max_retries=3, retry_del
                     try:
                         await cache_config(subreddit.display_name, updated_config)
                         await error_handler(f"The Flair Helper wiki page configuration for /r/{subreddit.display_name} has been successfully cached and reloaded.", notify_discord=True)
+
+                        # Save the validated and corrected configuration back to the wiki page
+                        await wiki_page.edit(content=json.dumps(updated_config, indent=4))
 
                         if send_pm_on_wiki_config_update:
                             try:
@@ -412,6 +437,21 @@ def compress_notes(notes):
     compressed = base64.b64encode(zlib.compress(json.dumps(notes).encode('utf-8'))).decode('utf-8')
     return compressed
 
+def add_usernote(notes, author, note_text, link, mod_index, usernote_type_index):
+    if author not in notes:
+        notes[author] = {"ns": []}
+
+    timestamp = int(time.time())
+    submission_id = link.split('/')[-3]
+    new_note = {
+        "n": f"[FH] {note_text}",
+        "t": timestamp,
+        "m": mod_index,
+        "l": f"l,{submission_id}",
+        "w": usernote_type_index
+    }
+    notes[author]["ns"].append(new_note)
+
 async def update_usernotes(subreddit, author, note_text, link, mod_name, usernote_type_name=None):
     async with usernotes_lock:
         try:
@@ -449,26 +489,6 @@ async def update_usernotes(subreddit, author, note_text, link, mod_name, usernot
 
         except Exception as e:
             await error_handler(f"update_usernotes: Error updating usernotes: {e}", notify_discord=True)
-
-
-def add_usernote(notes, author, note_text, link, mod_index, usernote_type_index):
-    if author not in notes:
-        notes[author] = {"ns": []}
-
-    timestamp = int(time.time())
-    submission_id = link.split('/')[-3]
-    new_note = {
-        "n": f"[FH] {note_text}",
-        "t": timestamp,
-        "m": mod_index,
-        "l": f"l,{submission_id}",
-        "w": usernote_type_index
-    }
-    notes[author]["ns"].append(new_note)
-
-
-async def send_modmail(subreddit, subject, message):
-    await subreddit.message(subject, message)
 
 
 def send_webhook_notification(config, post, flair_text, mod_name, flair_guid):
@@ -1302,13 +1322,22 @@ async def check_new_mod_invitations(reddit, bot_username):
 async def monitor_mod_log(reddit, bot_username):
     accounts_to_ignore = ['AssistantBOT1', 'anyadditionalacctshere', 'thatmayinteractwithflair']
 
-    #moderated_subreddits = []
-    #async for subreddit in reddit.user.moderator_subreddits():
-    #    moderated_subreddits.append(subreddit)
+    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair Helper 2 has started up successfully!\nBot username: {bot_username}") if verbosemode else None
+
+    moderated_subreddits = []
+    async for subreddit in reddit.user.moderator_subreddits():
+        if f"u_{bot_username}" not in subreddit.display_name:
+            #continue  # Skip the bot's own user page
+            moderated_subreddits.append(subreddit.display_name)
     #print(f"Moderated Subreddits: {moderated_subreddits}")
 
-    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair Helper 2 has started up successfully!\nBot username: {bot_username}") if verbosemode else None
-    await discord_status_notification(f"Flair Helper 2 has started up successfully!\nBot username: {bot_username}")
+    # Sort subreddits alphabetically ignoring case for sorting
+    moderated_subreddits = sorted(moderated_subreddits, key=lambda x: x.lower())
+
+    formatted_subreddits = "\n   ".join(moderated_subreddits)
+    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: {bot_username} moderates subreddits:\n   {formatted_subreddits}") if verbosemode else None
+
+    await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair Helper 2 has started up successfully!\nBot username: **{bot_username}**\n\n{bot_username} moderates subreddits:\n   {formatted_subreddits}")
 
     while True:
         try:
@@ -1366,10 +1395,16 @@ async def monitor_mod_log(reddit, bot_username):
 
 
 
+async def delayed_fetch_and_cache_configs(reddit, bot_username, delay):
+    await asyncio.sleep(delay)  # Wait for the specified delay
+    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Waited {delay}, Now processing fetch_and_cache_configs.") if debugmode else None
+    await fetch_and_cache_configs(reddit, bot_username)  # Fetch and cache configurations
+
+
 # Create Multithreaded Instance to monitor all subs that have a valid Flair_Helper configuration
 async def run_bot_async(reddit, bot_username):
     # Correctly await the asynchronous function call
-    await fetch_and_cache_configs(reddit, bot_username)  # This is adapted to be async
+    #await fetch_and_cache_configs(reddit, bot_username)  # This is adapted to be async
     await monitor_mod_log(reddit, bot_username)
 
 
@@ -1377,13 +1412,15 @@ async def run_bot_async(reddit, bot_username):
 async def monitor_private_messages(reddit):
     while True:
         await handle_private_messages(reddit)
-        await asyncio.sleep(60)  # Sleep for 60 seconds before the next iteration
+        await asyncio.sleep(120)  # Sleep for 60 seconds before the next iteration
 
 
 async def main():
     max_retries = 3
     retry_delay = 30  # Delay in seconds between retries
     max_retry_delay = 120  # Maximum delay in seconds between retries
+
+    wiki_fetch_delay = 90
 
     for attempt in range(max_retries):
         try:
@@ -1393,12 +1430,20 @@ async def main():
             me = await reddit.user.me()
             bot_username = me.name
 
+            # Check if the database is empty
+            if is_database_empty():
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Database is empty. Fetching and caching configurations for all moderated subreddits.") if verbosemode else None
+                await fetch_and_cache_configs(reddit, bot_username)
+            else:
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Database contains subreddit configurations. Proceeding with the delayed fetch and cache.") if verbosemode else None
+
             # Create separate tasks for each coroutine
             bot_task = asyncio.create_task(run_bot_async(reddit, bot_username))
             pm_task = asyncio.create_task(monitor_private_messages(reddit))
+            wiki_cache_task = asyncio.create_task(delayed_fetch_and_cache_configs(reddit, bot_username, wiki_fetch_delay))
             mod_invites_task = asyncio.create_task(check_new_mod_invitations(reddit, bot_username))
 
-            await asyncio.gather(bot_task, pm_task, mod_invites_task)
+            await asyncio.gather(bot_task, pm_task, wiki_cache_task, mod_invites_task)
 
             # If the bot starts successfully, break out of the retry loop
             break
