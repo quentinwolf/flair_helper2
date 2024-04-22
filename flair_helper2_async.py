@@ -15,6 +15,7 @@ import os
 import traceback
 import concurrent.futures
 from logging.handlers import TimedRotatingFileHandler
+from asyncprawcore import exceptions as asyncprawcore_exceptions
 from asyncprawcore import ResponseException
 from asyncprawcore import NotFound
 from discord_webhook import DiscordWebhook, DiscordEmbed
@@ -48,7 +49,67 @@ async def error_handler(error_message, notify_discord=False):
     if notify_discord:
         await discord_status_notification(error_message)
 
+# Error handler by u/ParkingPsychology https://www.reddit.com/r/redditdev/comments/xtrvb7/praw_how_to_handle/iqupaxz/
+def reddit_error_handler(func):
+    max_retries = 5
+    retry_delay = 5  # Delay in seconds between retries
+    max_retry_delay = 120  # Maximum delay in seconds between retries
 
+    async def inner_function(*args, **kwargs):
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                return await func(*args, **kwargs)
+            except asyncprawcore_exceptions.ServerError:
+                await error_handler("reddit_error_handler - Error: asyncprawcore.exceptions.ServerError", notify_discord=True)
+                await asyncio.sleep(20)
+            except asyncprawcore_exceptions.Forbidden:
+                await error_handler("reddit_error_handler - Error: asyncprawcore.exceptions.Forbidden", notify_discord=True)
+                await asyncio.sleep(20)
+            except asyncprawcore_exceptions.ResponseException:
+                await error_handler("reddit_error_handler - Error: asyncprawcore.exceptions.ResponseException", notify_discord=True)
+                await asyncio.sleep(20)
+            except asyncprawcore_exceptions.RequestException:
+                await error_handler("reddit_error_handler - Error: asyncprawcore.exceptions.RequestException", notify_discord=True)
+                await asyncio.sleep(20)
+            except asyncpraw.exceptions.RedditAPIException as exception:
+                await error_handler("reddit_error_handler - Error: asyncpraw.exceptions.RedditAPIException", notify_discord=True)
+                for subexception in exception.items:
+                    if subexception.error_type == 'RATELIMIT':
+                        message = subexception.message.replace("Looks like you've been doing that a lot. Take a break for ", "").replace("before trying again.", "")
+                        if 'second' in message:
+                            time_to_wait = int(message.split(" ")[0]) + 15
+                            await error_handler(f"reddit_error_handler - Waiting for {time_to_wait} seconds due to rate limit", notify_discord=True)
+                            await asyncio.sleep(time_to_wait)
+                        elif 'minute' in message:
+                            time_to_wait = (int(message.split(" ")[0]) * 60) + 15
+                            await error_handler(f"reddit_error_handler - Waiting for {time_to_wait} seconds due to rate limit", notify_discord=True)
+                            await asyncio.sleep(time_to_wait)
+                    else:
+                        await error_handler(f"reddit_error_handler - Different Error: {subexception}", notify_discord=True)
+                await asyncio.sleep(retry_delay)
+            except Exception as e:
+                await error_handler(f"reddit_error_handler - Unexpected Error: {str(e)}", notify_discord=True)
+                await asyncio.sleep(retry_delay)
+
+        # Retry loop
+        for i in range(max_retries):
+            if attempt < max_retries - 1:
+                retry_delay = min(retry_delay * 2, max_retry_delay)  # Exponential backoff
+                try:
+                    return await inner_function(*args, **kwargs)
+                except Exception as e:
+                    await error_handler(f"reddit_error_handler - Retry attempt {i+1} failed. Retrying in {retry_delay} seconds...  Error: {str(e)}", notify_discord=True)
+                    await asyncio.sleep(retry_delay)
+            else:
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Exiting...")
+                raise
+
+    return inner_function
+
+
+
+@reddit_error_handler
 async def get_subreddit(reddit, subreddit_name):
     subreddit = await reddit.subreddit(subreddit_name)
     #subreddit_cache[subreddit_name] = subreddit
@@ -112,6 +173,7 @@ def is_database_empty():
         return True
 
 
+@reddit_error_handler
 async def get_latest_wiki_revision(subreddit):
     try:
         # Use get_page to fetch the wiki page
@@ -232,6 +294,7 @@ async def discord_status_notification(message):
             print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error sending Discord status notification: {str(e)}") if debugmode else None
 
 
+@reddit_error_handler
 async def check_mod_permissions(subreddit, mod_name):
     moderators = await subreddit.moderator()
     for moderator in moderators:
@@ -260,7 +323,8 @@ def validate_and_correct_config(config):
 
     return corrected_config
 
-    
+
+@reddit_error_handler
 async def fetch_and_cache_configs(reddit, bot_username, max_retries=3, retry_delay=1, max_retry_delay=60, single_sub=None):
     create_database()
     moderated_subreddits = []
@@ -277,151 +341,100 @@ async def fetch_and_cache_configs(reddit, bot_username, max_retries=3, retry_del
         retries = 0
         while retries < max_retries:
             try:
+                # Access wiki page using asyncpraw
+                wiki_page = await subreddit.wiki.get_page('flair_helper')
+                wiki_content = wiki_page.content_md.strip()
+                # The rest of your code to handle the wiki content goes here
+            except Exception as e:
+                # Handle exceptions appropriately
+                await error_handler(f"Error accessing the /r/{subreddit.display_name} flair_helper wiki page: {e}", notify_discord=True)
+
+            if not wiki_content:
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair Helper configuration for /r/{subreddit.display_name} is blank. Skipping...") if debugmode else None
+                break  # Skip processing if the wiki page is blank
+
+            try:
+                # Try parsing the content as JSON
+                updated_config = json.loads(wiki_content)
+            except json.JSONDecodeError:
                 try:
-                    # Access wiki page using asyncpraw
-                    wiki_page = await subreddit.wiki.get_page('flair_helper')
-                    wiki_content = wiki_page.content_md.strip()
-                    # The rest of your code to handle the wiki content goes here
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error parsing Flair Helper configuration as JSON for /r/{subreddit.display_name}.  Attempting YAML to JSON conversion...") if debugmode else None
+                    # If JSON parsing fails, try parsing as YAML
+                    updated_config = yaml.safe_load(wiki_content)
+                    # Convert the YAML configuration to JSON format
+                    updated_config = convert_yaml_to_json(updated_config)
+                except yaml.YAMLError:
+                    # If both JSON and YAML parsing fail, send a notification to the subreddit
+                    subject = f"Flair Helper Configuration Error in /r/{subreddit.display_name}"
+                    message = (
+                        f"The Flair Helper configuration for /r/{subreddit.display_name} is in an unsupported or invalid format.\n\n"
+                        f"Please check the [flair_helper wiki page](https://www.reddit.com/r/{subreddit.display_name}/wiki/flair_helper) "
+                        f"and ensure that the configuration is in a valid JSON format.\n\n"
+                        f"Flair Helper supports legacy loading of YAML configurations, which will be automatically converted to JSON format. "
+                        f"However, going forward, the JSON format is preferred and will be used for saving and processing the configuration.\n\n"
+                        f"If you need assistance, please refer to the Flair Helper documentation or contact the bot maintainer."
+                    )
+                    if send_pm_on_wiki_config_update:
+                        await subreddit.message(subject, message)
+                    raise ValueError(f"Unsupported or invalid configuration format for /r/{subreddit.display_name}")
+
+            # Perform validation and automatic correction
+            updated_config = validate_and_correct_config(updated_config)
+
+            cached_config = get_cached_config(subreddit.display_name)
+
+            if cached_config is None or cached_config != updated_config:
+                # Check if the mod who edited the wiki page has the "config" permission
+                if updated_config[0]['GeneralConfiguration'].get('require_config_to_edit', False):
+                    wiki_revision = await get_latest_wiki_revision(subreddit)
+                    mod_name = wiki_revision['author']
+
+                    if mod_name != bot_username:
+                        mod_permissions = await check_mod_permissions(subreddit, mod_name)
+                        if mod_permissions is not None and ('all' in mod_permissions or 'config' in mod_permissions):
+                            # The moderator has the 'config' permission or 'all' permissions
+                            pass
+                        else:
+                            # The moderator does not have the 'config' permission or is not a moderator
+                            await error_handler(f"Mod {mod_name} does not have permission to edit wiki in /r/{subreddit.display_name}\n\nMod {mod_name} has the following permissions in /r/{subreddit.display_name}: {mod_permissions}", notify_discord=True)
+                            break  # Skip reloading the configuration and continue with the next subreddit
+                    # If mod_name is the bot's own username, proceed with caching the configuration
+
+                try:
+                    await cache_config(subreddit.display_name, updated_config)
+                    await error_handler(f"The Flair Helper wiki page configuration for /r/{subreddit.display_name} has been successfully cached and reloaded.", notify_discord=True)
+
+                    # Save the validated and corrected configuration back to the wiki page
+                    await wiki_page.edit(content=json.dumps(updated_config, indent=4))
+
+                    if send_pm_on_wiki_config_update:
+                        try:
+                            subreddit_instance = await get_subreddit(reddit, subreddit.display_name)
+                            await subreddit_instance.message(
+                                subject="Flair Helper Configuration Reloaded",
+                                message=f"The Flair Helper configuration for /r/{subreddit.display_name} has been successfully reloaded."
+                            )
+                        except asyncpraw.exceptions.RedditAPIException as e:
+                            await error_handler(f"Error sending message to /r/{subreddit.display_name}: {e}", notify_discord=True)
                 except Exception as e:
-                    # Handle exceptions appropriately
-                    await error_handler(f"Error accessing the /r/{subreddit.display_name} flair_helper wiki page: {e}", notify_discord=True)
-
-                if not wiki_content:
-                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair Helper configuration for /r/{subreddit.display_name} is blank. Skipping...") if debugmode else None
-                    break  # Skip processing if the wiki page is blank
-
-                try:
-                    # Try parsing the content as JSON
-                    updated_config = json.loads(wiki_content)
-                except json.JSONDecodeError:
-                    try:
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error parsing Flair Helper configuration as JSON for /r/{subreddit.display_name}.  Attempting YAML to JSON conversion...") if debugmode else None
-                        # If JSON parsing fails, try parsing as YAML
-                        updated_config = yaml.safe_load(wiki_content)
-                        # Convert the YAML configuration to JSON format
-                        updated_config = convert_yaml_to_json(updated_config)
-                    except yaml.YAMLError:
-                        # If both JSON and YAML parsing fail, send a notification to the subreddit
-                        subject = f"Flair Helper Configuration Error in /r/{subreddit.display_name}"
-                        message = (
-                            f"The Flair Helper configuration for /r/{subreddit.display_name} is in an unsupported or invalid format.\n\n"
-                            f"Please check the [flair_helper wiki page](https://www.reddit.com/r/{subreddit.display_name}/wiki/flair_helper) "
-                            f"and ensure that the configuration is in a valid JSON format.\n\n"
-                            f"Flair Helper supports legacy loading of YAML configurations, which will be automatically converted to JSON format. "
-                            f"However, going forward, the JSON format is preferred and will be used for saving and processing the configuration.\n\n"
-                            f"If you need assistance, please refer to the Flair Helper documentation or contact the bot maintainer."
-                        )
-                        if send_pm_on_wiki_config_update:
-                            await subreddit.message(subject, message)
-                        raise ValueError(f"Unsupported or invalid configuration format for /r/{subreddit.display_name}")
-
-                # Perform validation and automatic correction
-                updated_config = validate_and_correct_config(updated_config)
-
-                cached_config = get_cached_config(subreddit.display_name)
-
-                if cached_config is None or cached_config != updated_config:
-                    # Check if the mod who edited the wiki page has the "config" permission
-                    if updated_config[0]['GeneralConfiguration'].get('require_config_to_edit', False):
-                        wiki_revision = await get_latest_wiki_revision(subreddit)
-                        mod_name = wiki_revision['author']
-
-                        if mod_name != bot_username:
-                            mod_permissions = await check_mod_permissions(subreddit, mod_name)
-                            if mod_permissions is not None and ('all' in mod_permissions or 'config' in mod_permissions):
-                                # The moderator has the 'config' permission or 'all' permissions
-                                pass
-                            else:
-                                # The moderator does not have the 'config' permission or is not a moderator
-                                await error_handler(f"Mod {mod_name} does not have permission to edit wiki in /r/{subreddit.display_name}\n\nMod {mod_name} has the following permissions in /r/{subreddit.display_name}: {mod_permissions}", notify_discord=True)
-                                break  # Skip reloading the configuration and continue with the next subreddit
-                        # If mod_name is the bot's own username, proceed with caching the configuration
-
-                    try:
-                        await cache_config(subreddit.display_name, updated_config)
-                        await error_handler(f"The Flair Helper wiki page configuration for /r/{subreddit.display_name} has been successfully cached and reloaded.", notify_discord=True)
-
-                        # Save the validated and corrected configuration back to the wiki page
-                        await wiki_page.edit(content=json.dumps(updated_config, indent=4))
-
-                        if send_pm_on_wiki_config_update:
-                            try:
-                                subreddit_instance = await get_subreddit(reddit, subreddit.display_name)
-                                await subreddit_instance.message(
-                                    subject="Flair Helper Configuration Reloaded",
-                                    message=f"The Flair Helper configuration for /r/{subreddit.display_name} has been successfully reloaded."
-                                )
-                            except asyncpraw.exceptions.RedditAPIException as e:
-                                await error_handler(f"Error sending message to /r/{subreddit.display_name}: {e}", notify_discord=True)
-                    except Exception as e:
-                        await error_handler(f"Error caching configuration for /r/{subreddit.display_name}: {e}", notify_discord=True)
-                        if send_pm_on_wiki_config_update:
-                            try:
-                                subreddit_instance = await get_subreddit(reddit, subreddit.display_name)
-                                await subreddit_instance.message(
-                                    subject="Flair Helper Configuration Error",
-                                    message=f"The Flair Helper configuration for /r/{subreddit.display_name} could not be cached due to errors:\n\n{e}"
-                                )
-                            except asyncpraw.exceptions.RedditAPIException as e:
-                                await error_handler(f"Error sending message to /r/{subreddit.display_name}: {e}", notify_discord=True)
-                else:
-                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: The Flair Helper wiki page configuration for /r/{subreddit.display_name} has not changed.") if debugmode else None
-                    await asyncio.sleep(1)  # Adjust the delay as needed
-                break  # Configuration loaded successfully, exit the retry loop
-            except (aiohttp.ClientError, asyncio.TimeoutError, asyncprawcore.exceptions.ServerError) as e:
-                error_message = f"fetch_and_cache_configs: Error connecting to Reddit API or received 500 HTTP response: {str(e)}"
-                print(error_message) if debugmode else None
-                await error_handler(error_message, notify_discord=True)
-                retries += 1
-                if retries < max_retries:
-                    print(f"Retrying in {retry_delay} seconds...")
-                    await asyncio.sleep(retry_delay)
-                    retry_delay = min(retry_delay * 2, max_retry_delay)
-                else:
-                    print(f"Max retries exceeded for /r/{subreddit.display_name}. Skipping...")
-                    break  # Skip to the next subreddit if max retries exceeded
-            except asyncpraw.exceptions.RedditAPIException as e:
-                if "RATELIMIT" in str(e.message):
-                    wait_time_match = re.search(r"for (\d+) minute", str(e.message))
-                    if wait_time_match:
-                        wait_minutes = int(wait_time_match.group(1))
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Rate limited. Waiting for {wait_minutes} minutes before retrying.")
-                        await asyncio.sleep(wait_minutes * 60)
-                        continue
-                    else:
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Rate limited, but could not extract wait time.")
-                        await asyncio.sleep(60)  # Wait for a default duration before retrying
-                        continue
-                else:
-                    await error_handler(f"fetch_and_cache_configs: Reddit API Exception in /r/{subreddit.display_name}: {e}", notify_discord=True)
-                    break  # Skip to the next subreddit if a non-rate limit exception occurs
-            except (asyncprawcore.exceptions.ResponseException, asyncprawcore.exceptions.RequestException) as e:
-                await error_handler(f"Error loading configuration for /r/{subreddit.display_name}: {e}", notify_discord=True)
-                retries += 1
-                if retries < max_retries:
-                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
-                    await asyncio.sleep(retry_delay)
-                    retry_delay = min(retry_delay * 2, max_retry_delay)  # Double the retry delay, but don't exceed the maximum
-                else:
-                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded for /r/{subreddit.display_name}. Skipping...") if debugmode else None
-                    break  # Skip to the next subreddit if max retries exceeded
-            except asyncprawcore.exceptions.Forbidden:
-                await error_handler(f"Error: Bot does not have permission to access the wiki page in /r/{subreddit.display_name}", notify_discord=True)
-                break  # Skip retrying if the bot doesn't have permission
-            except asyncprawcore.exceptions.NotFound:
-                await error_handler(f"Flair Helper wiki page doesn't exist for /r/{subreddit.display_name}", notify_discord=True)
-                if send_pm_on_wiki_config_update:
-                    try:
-                        subreddit_instance = await get_subreddit(reddit, subreddit.display_name)
-                        await subreddit_instance.message(
-                            subject="Flair Helper Wiki Page Not Found",
-                            message=f"The Flair Helper wiki page doesn't exist for /r/{subreddit.display_name}. Please go to https://www.reddit.com/r/{subreddit.display_name}/wiki/flair_helper and create the page to add this subreddit.  You can send me a PM with 'list' or 'auto' to generate a sample configuration.\n\n[Generate a List of Flairs](https://www.reddit.com/message/compose?to=/u/{bot_username}&subject=list&message={subreddit.display_name})\n\n[Auto-Generate a sample Flair Helper Config](https://www.reddit.com/message/compose?to=/u/{bot_username}&subject=auto&message={subreddit.display_name})\n\nYou can find more information in the Flair Helper documentation on /r/Flair_Helper2/wiki/tutorial/ \n\nHappy Flairing!"
-                        )
-                    except asyncpraw.exceptions.RedditAPIException as e:
-                        await error_handler(f"Error sending modmail to /r/{subreddit.display_name}: {e}", notify_discord=True)
-                break  # Skip retrying if the wiki page doesn't exist
+                    await error_handler(f"Error caching configuration for /r/{subreddit.display_name}: {e}", notify_discord=True)
+                    if send_pm_on_wiki_config_update:
+                        try:
+                            subreddit_instance = await get_subreddit(reddit, subreddit.display_name)
+                            await subreddit_instance.message(
+                                subject="Flair Helper Configuration Error",
+                                message=f"The Flair Helper configuration for /r/{subreddit.display_name} could not be cached due to errors:\n\n{e}"
+                            )
+                        except asyncpraw.exceptions.RedditAPIException as e:
+                            await error_handler(f"Error sending message to /r/{subreddit.display_name}: {e}", notify_discord=True)
+            else:
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: The Flair Helper wiki page configuration for /r/{subreddit.display_name} has not changed.") if debugmode else None
+                await asyncio.sleep(1)  # Adjust the delay as needed
+            break  # Configuration loaded successfully, exit the retry loop
 
         await asyncio.sleep(retry_delay)  # Add a delay between subreddit configurations
+
+    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Completed checking all Wiki page configuration.") if debugmode else None
 
 
 # Toolbox Note Handlers
@@ -452,43 +465,41 @@ def add_usernote(notes, author, note_text, link, mod_index, usernote_type_index)
     }
     notes[author]["ns"].append(new_note)
 
+@reddit_error_handler
 async def update_usernotes(subreddit, author, note_text, link, mod_name, usernote_type_name=None):
     async with usernotes_lock:
-        try:
-            usernotes_wiki = await subreddit.wiki.get_page("usernotes")
-            usernotes_content = usernotes_wiki.content_md
-            usernotes_data = json.loads(usernotes_content)
+        usernotes_wiki = await subreddit.wiki.get_page("usernotes")
+        usernotes_content = usernotes_wiki.content_md
+        usernotes_data = json.loads(usernotes_content)
 
-            if 'blob' not in usernotes_data:
-                usernotes_data['blob'] = ''
+        if 'blob' not in usernotes_data:
+            usernotes_data['blob'] = ''
 
-            decompressed_notes = decompress_notes(usernotes_data['blob'])
+        decompressed_notes = decompress_notes(usernotes_data['blob'])
 
-            if 'constants' not in usernotes_data:
-                usernotes_data['constants'] = {'users': [], 'warnings': []}
+        if 'constants' not in usernotes_data:
+            usernotes_data['constants'] = {'users': [], 'warnings': []}
 
-            if mod_name not in usernotes_data['constants']['users']:
-                usernotes_data['constants']['users'].append(mod_name)
+        if mod_name not in usernotes_data['constants']['users']:
+            usernotes_data['constants']['users'].append(mod_name)
 
-            mod_index = usernotes_data['constants']['users'].index(mod_name)
+        mod_index = usernotes_data['constants']['users'].index(mod_name)
 
-            if usernote_type_name:
-                if usernote_type_name not in usernotes_data['constants']['warnings']:
-                    usernotes_data['constants']['warnings'].append(usernote_type_name)
-                usernote_type_index = usernotes_data['constants']['warnings'].index(usernote_type_name)
-            else:
-                usernote_type_index = 0  # Use the default index if usernote_type_name is not provided
+        if usernote_type_name:
+            if usernote_type_name not in usernotes_data['constants']['warnings']:
+                usernotes_data['constants']['warnings'].append(usernote_type_name)
+            usernote_type_index = usernotes_data['constants']['warnings'].index(usernote_type_name)
+        else:
+            usernote_type_index = 0  # Use the default index if usernote_type_name is not provided
 
-            add_usernote(decompressed_notes, author, note_text, link, mod_index, usernote_type_index)
+        add_usernote(decompressed_notes, author, note_text, link, mod_index, usernote_type_index)
 
-            usernotes_data['blob'] = compress_notes(decompressed_notes)
+        usernotes_data['blob'] = compress_notes(decompressed_notes)
 
-            compressed_notes = json.dumps(usernotes_data)
-            edit_reason = f"note added on user {author} via flair_helper2"
-            await usernotes_wiki.edit(content=compressed_notes, reason=edit_reason)
+        compressed_notes = json.dumps(usernotes_data)
+        edit_reason = f"note added on user {author} via flair_helper2"
+        await usernotes_wiki.edit(content=compressed_notes, reason=edit_reason)
 
-        except Exception as e:
-            await error_handler(f"update_usernotes: Error updating usernotes: {e}", notify_discord=True)
 
 
 def send_webhook_notification(config, post, flair_text, mod_name, flair_guid):
@@ -558,6 +569,7 @@ def send_webhook_notification(config, post, flair_text, mod_name, flair_guid):
         response = webhook.execute()
 
 # Async function to fetch a user's current flair in a subreddit
+@reddit_error_handler
 async def fetch_user_flair(subreddit, username):
     async for flair in subreddit.flair(redditor=username):
         #print(f"Flair: {flair}") if debugmode else None
@@ -566,35 +578,24 @@ async def fetch_user_flair(subreddit, username):
     return None  # If no flair is set
 
 # Primary process to handle any flair changes that appear in the logs
+@reddit_error_handler
 async def process_flair_assignment(reddit, log_entry, config, subreddit, max_retries=3, retry_delay=5):
     target_fullname = log_entry.target_fullname
     if target_fullname.startswith('t3_'):  # Check if it's a submission
 
-        for attempt in range(max_retries):
-            try:
-                submission_id = target_fullname[3:]  # Remove the 't3_' prefix
-                post = await reddit.submission(submission_id)
-                flair_guid = getattr(post, 'link_flair_template_id', None)  # Use getattr to safely retrieve the attribute
-                # Get the post title and author for debugging
-                post_author_name = post.author.name if post.author else "[deleted]"
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair GUID {flair_guid} detected on ID: {submission_id} on post '{post.title}' by {post_author_name} in /r/{subreddit.display_name}") if debugmode else None
-                # boolean variable to track whether the author is deleted or suspended:
-                is_author_deleted_or_suspended = post_author_name == "[deleted]"
 
-                # Reload the configuration from the database
-                config = get_cached_config(subreddit.display_name)
-                break
+        submission_id = target_fullname[3:]  # Remove the 't3_' prefix
+        post = await reddit.submission(submission_id)
+        flair_guid = getattr(post, 'link_flair_template_id', None)  # Use getattr to safely retrieve the attribute
+        # Get the post title and author for debugging
+        post_author_name = post.author.name if post.author else "[deleted]"
+        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair GUID {flair_guid} detected on ID: {submission_id} on post '{post.title}' by {post_author_name} in /r/{subreddit.display_name}") if debugmode else None
+        # boolean variable to track whether the author is deleted or suspended:
+        is_author_deleted_or_suspended = post_author_name == "[deleted]"
 
-            except asyncprawcore.exceptions.RequestException as e:
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment: Error connecting to Reddit API: {str(e)}") if debugmode else None
-                if attempt < max_retries - 1:
-                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
-                    await asyncio.sleep(retry_delay)
-                else:
-                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded.") if debugmode else None
-                    await error_handler(f"process_flair_assignment: Error processing flair for {post_author_name} in /r/{subreddit.display_name}: {e}", notify_discord=True)
-                    # Submission detailed failed to low return from function.
-                    return
+        # Reload the configuration from the database
+        config = get_cached_config(subreddit.display_name)
+
 
         if config is None:
             print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Configuration not found for /r/{subreddit.display_name}. Skipping flair assignment.")
@@ -1065,7 +1066,9 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit, max_ret
 
 
 
+
 # Handle Private Messages to allow the bot to reply back with a list of flairs for convenience
+@reddit_error_handler
 async def handle_private_messages(reddit):
     async for message in reddit.inbox.unread(limit=None):
         if isinstance(message, asyncpraw.models.Message):
@@ -1150,6 +1153,7 @@ async def handle_private_messages(reddit):
                 await error_handler(f"handle_private_messages: Error replying to message: {e}", notify_discord=True)
 
 
+@reddit_error_handler
 async def create_auto_flairhelper_wiki(reddit, subreddit, mode):
     # Filter for mod-only flair templates
     flair_templates = [
@@ -1246,6 +1250,7 @@ async def create_auto_flairhelper_wiki(reddit, subreddit, mode):
     return final_output
 
 
+@reddit_error_handler
 async def check_new_mod_invitations(reddit, bot_username):
     while True:
         current_subreddits = [sub async for sub in reddit.user.moderator_subreddits()]
@@ -1260,65 +1265,31 @@ async def check_new_mod_invitations(reddit, bot_username):
 
             subreddit_instance = await get_subreddit(reddit, subreddit.display_name)
 
-            max_retries = 3
-            retry_delay = 5  # Delay in seconds between retries
 
-            for attempt in range(max_retries):
-                try:
-                    wiki_page = await subreddit.wiki.get_page('flair_helper')
-                    wiki_content = wiki_page.content_md.strip()
+            wiki_page = await subreddit.wiki.get_page('flair_helper')
+            wiki_content = wiki_page.content_md.strip()
 
-                    if not wiki_content:
-                        # Flair Helper wiki page exists but is blank
-                        auto_gen_config = await create_auto_flairhelper_wiki(reddit, subreddit, mode="wiki")
-                        await subreddit.wiki.create('flair_helper', auto_gen_config)
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Created auto_gen_config for 'flair_helper' wiki page for /r/{subreddit.display_name}") if debugmode else None
+            if not wiki_content:
+                # Flair Helper wiki page exists but is blank
+                auto_gen_config = await create_auto_flairhelper_wiki(reddit, subreddit, mode="wiki")
+                await subreddit.wiki.create('flair_helper', auto_gen_config)
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Created auto_gen_config for 'flair_helper' wiki page for /r/{subreddit.display_name}") if debugmode else None
 
-                        subject = f"Flair Helper Configuration Needed for /r/{subreddit.display_name}"
-                        message = f"Hi! I noticed that I was recently added as a moderator to /r/{subreddit.display_name}.\n\nThe Flair Helper wiki page here: /r/{subreddit.display_name}/wiki/flair_helper exists but was currently blank.  I've went ahead and generated a working config based upon your 'Mod Only' flairs you have configured.  Otherwise, you can send me a PM with 'list' or 'auto' to generate a sample configuration.\n\n[Generate a List of Flairs](https://www.reddit.com/message/compose?to=/u/{bot_username}&subject=list&message={subreddit.display_name})\n\n[Auto-Generate a sample Flair Helper Config](https://www.reddit.com/message/compose?to=/u/{bot_username}&subject=auto&message={subreddit.display_name})\n\nYou can find more information in the Flair Helper documentation on /r/Flair_Helper2/wiki/tutorial/ \n\nHappy Flairing!"
-                        await subreddit_instance.message(subject, message)
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Sent PM to /r/{subreddit.display_name} moderators to create a Flair Helper configuration (wiki page exists but is blank)") if debugmode else None
-                    else:
-                        # Flair Helper wiki page exists and has content
-                        await fetch_and_cache_configs(reddit, bot_username, max_retries=3, retry_delay=5, single_sub=subreddit.display_name)
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Fetched and cached configuration for /r/{subreddit.display_name}") if debugmode else None
-                    break
-
-                except asyncprawcore.exceptions.NotFound:
-                    # Flair Helper wiki page doesn't exist
-                    auto_gen_config = await create_auto_flairhelper_wiki(reddit, subreddit, mode="wiki")
-                    await subreddit.wiki.create('flair_helper', auto_gen_config)
-                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Created auto_gen_config for 'flair_helper' wiki page for /r/{subreddit.display_name}") if debugmode else None
-
-                    subject = f"Flair Helper Configuration Needed for /r/{subreddit.display_name}"
-                    message = f"Hi! I noticed that I was recently added as a moderator to /r/{subreddit.display_name}. To use my Flair Helper features, please setup your configuration on the newly created 'flair_helper' wiki page here: /r/{subreddit.display_name}/wiki/flair_helper \n\nI've went ahead and generated a working config based upon your 'Mod Only' flairs you have configured.  Otherwise, you can send me a PM with 'list' or 'auto' to generate a sample configuration.\n\n[Generate a List of Flairs](https://www.reddit.com/message/compose?to=/u/{bot_username}&subject=list&message={subreddit.display_name})\n\n[Auto-Generate a sample Flair Helper Config](https://www.reddit.com/message/compose?to=/u/{bot_username}&subject=auto&message={subreddit.display_name})\n\nYou can find more information in the Flair Helper documentation on /r/Flair_Helper2/wiki/tutorial/ \n\nHappy Flairing!"
-                    await subreddit_instance.message(subject, message)
-                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Sent PM to /r/{subreddit.display_name} moderators to create a Flair Helper configuration (wiki page created)") if debugmode else None
-
-                except asyncpraw.exceptions.RedditAPIException as e:
-                    if "RATELIMIT" in str(e.message):
-                        wait_time_match = re.search(r"for (\d+) minute", str(e.message))
-                        if wait_time_match:
-                            wait_minutes = int(wait_time_match.group(1))
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Rate limited. Waiting for {wait_minutes} minutes before retrying.") if debugmode else None
-                            await discord_status_notification(f"check_new_mod_invitations Rate Limited for /r/{subreddit.display_name}.  Waiting for {wait_minutes} minutes before retrying.")
-                            await asyncio.sleep(wait_minutes * 60 + retry_delay)
-                            # After waiting, you might need to retry the operation that triggered the rate limit
-                        else:
-                            print("Rate limited, but could not extract wait time.") if debugmode else None
-                            await discord_status_notification(f"check_new_mod_invitations Rate limited for /r/{subreddit.display_name}, but could not extract wait time.")
-                            await asyncio.sleep(retry_delay)  # Wait for a default delay before retrying
-
-                    else:
-                        await error_handler(f"check_new_mod_invitations: Reddit API Exception in /r/{subreddit.display_name}: {e}", notify_discord=True)
-                        traceback.print_exc()  # Print the full traceback
-                        break
-
+                subject = f"Flair Helper Configuration Needed for /r/{subreddit.display_name}"
+                message = f"Hi! I noticed that I was recently added as a moderator to /r/{subreddit.display_name}.\n\nThe Flair Helper wiki page here: /r/{subreddit.display_name}/wiki/flair_helper exists but was currently blank.  I've went ahead and generated a working config based upon your 'Mod Only' flairs you have configured.  Otherwise, you can send me a PM with 'list' or 'auto' to generate a sample configuration.\n\n[Generate a List of Flairs](https://www.reddit.com/message/compose?to=/u/{bot_username}&subject=list&message={subreddit.display_name})\n\n[Auto-Generate a sample Flair Helper Config](https://www.reddit.com/message/compose?to=/u/{bot_username}&subject=auto&message={subreddit.display_name})\n\nYou can find more information in the Flair Helper documentation on /r/Flair_Helper2/wiki/tutorial/ \n\nHappy Flairing!"
+                await subreddit_instance.message(subject, message)
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Sent PM to /r/{subreddit.display_name} moderators to create a Flair Helper configuration (wiki page exists but is blank)") if debugmode else None
+            else:
+                # Flair Helper wiki page exists and has content
+                await fetch_and_cache_configs(reddit, bot_username, max_retries=3, retry_delay=5, single_sub=subreddit.display_name)
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Fetched and cached configuration for /r/{subreddit.display_name}") if debugmode else None
+            break
 
         await asyncio.sleep(3600)  # Check for new mod invitations every hour (adjust as needed)
 
 
 # Primary Mod Log Monitor
+@reddit_error_handler
 async def monitor_mod_log(reddit, bot_username):
     accounts_to_ignore = ['AssistantBOT1', 'anyadditionalacctshere', 'thatmayinteractwithflair']
 
@@ -1329,7 +1300,6 @@ async def monitor_mod_log(reddit, bot_username):
         if f"u_{bot_username}" not in subreddit.display_name:
             #continue  # Skip the bot's own user page
             moderated_subreddits.append(subreddit.display_name)
-    #print(f"Moderated Subreddits: {moderated_subreddits}")
 
     # Sort subreddits alphabetically ignoring case for sorting
     moderated_subreddits = sorted(moderated_subreddits, key=lambda x: x.lower())
@@ -1340,72 +1310,37 @@ async def monitor_mod_log(reddit, bot_username):
     await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair Helper 2 has started up successfully!\nBot username: **{bot_username}**\n\n{bot_username} moderates subreddits:\n   {formatted_subreddits}")
 
     while True:
-        try:
-            subreddit = await reddit.subreddit("mod")
-            async for log_entry in subreddit.mod.stream.log(skip_existing=True):
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: New log entry: {log_entry.action}") if verbosemode else None
+        subreddit = await reddit.subreddit("mod")
+        async for log_entry in subreddit.mod.stream.log(skip_existing=True):
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: New log entry: {log_entry.action}") if verbosemode else None
 
-                if log_entry.action == 'wikirevise':
-                    if 'flair_helper' in log_entry.details:
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair Helper wiki page revised by {log_entry.mod} in /r/{log_entry.subreddit}") if debugmode else None
-                        try:
-                            await fetch_and_cache_configs(reddit, bot_username, max_retries=3, retry_delay=5, single_sub=log_entry.subreddit)  # Make sure fetch_and_cache_configs is async
-                        except asyncprawcore.exceptions.NotFound:
-                            error_output = f"monitor_mod_log: Flair Helper wiki page not found in /r/{log_entry.subreddit}"
-                            print(error_output) if debugmode else None
-                            errors_logger.error(error_output)
-                elif (log_entry.action == 'editflair'
-                    and log_entry.mod not in accounts_to_ignore
-                    and log_entry.target_fullname is not None
-                    and log_entry.target_fullname.startswith('t3_')):
-                    # This is a link (submission) flair edit
-                        # Get the post object
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair action detected by {log_entry.mod} in /r/{log_entry.subreddit}") if debugmode else None
-                        subreddit_instance = await reddit.subreddit(log_entry.subreddit)
-                        config = get_cached_config(log_entry.subreddit)
-                        await process_flair_assignment(reddit, log_entry, config, subreddit_instance)  # Ensure process_flair_assignment is also async
-                else:
-                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Ignoring action: {log_entry.action} in /r/{log_entry.subreddit}") if verbosemode else None
-
-        except asyncprawcore.exceptions.ServerError as e:
-            error_message = f"monitor_mod_log: Received 500 HTTP response: {str(e)}"
-            print(error_message) if debugmode else None
-            await error_handler(error_message, notify_discord=True)
-
-            # Retry the request after a delay
-            await asyncio.sleep(60)  # Wait for 60 seconds before retrying
-            continue
-
-        except asyncpraw.exceptions.RedditAPIException as e:
-            if "RATELIMIT" in str(e.message):
-                wait_time_match = re.search(r"for (\d+) minute", str(e.message))
-                if wait_time_match:
-                    wait_minutes = int(wait_time_match.group(1))
-                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Rate limited. Waiting for {wait_minutes} minutes before retrying.")
-                    await asyncio.sleep(wait_minutes * 60)
-                    # After waiting, you might need to retry the operation that triggered the rate limit
-                    continue
-                else:
-                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Rate limited, but could not extract wait time.")
-                    await asyncio.sleep(60)  # Wait for a default duration before retrying
-                    continue
+            if log_entry.action == 'wikirevise':
+                if 'flair_helper' in log_entry.details:
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair Helper wiki page revised by {log_entry.mod} in /r/{log_entry.subreddit}") if debugmode else None
+                    try:
+                        await fetch_and_cache_configs(reddit, bot_username, max_retries=3, retry_delay=5, single_sub=log_entry.subreddit)  # Make sure fetch_and_cache_configs is async
+                    except asyncprawcore.exceptions.NotFound:
+                        error_output = f"monitor_mod_log: Flair Helper wiki page not found in /r/{log_entry.subreddit}"
+                        print(error_output) if debugmode else None
+                        errors_logger.error(error_output)
+            elif (log_entry.action == 'editflair'
+                and log_entry.mod not in accounts_to_ignore
+                and log_entry.target_fullname is not None
+                and log_entry.target_fullname.startswith('t3_')):
+                # This is a link (submission) flair edit
+                    # Get the post object
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair action detected by {log_entry.mod} in /r/{log_entry.subreddit}") if debugmode else None
+                    subreddit_instance = await reddit.subreddit(log_entry.subreddit)
+                    config = get_cached_config(log_entry.subreddit)
+                    await process_flair_assignment(reddit, log_entry, config, subreddit_instance)  # Ensure process_flair_assignment is also async
             else:
-                await error_handler(f"monitor_mod_log: Error: {e}", notify_discord=True)
-                traceback.print_exc()  # Print the full traceback
-
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Ignoring action: {log_entry.action} in /r/{log_entry.subreddit}") if verbosemode else None
 
 
 async def delayed_fetch_and_cache_configs(reddit, bot_username, delay):
     await asyncio.sleep(delay)  # Wait for the specified delay
     print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Waited {delay}, Now processing fetch_and_cache_configs.") if debugmode else None
     await fetch_and_cache_configs(reddit, bot_username)  # Fetch and cache configurations
-
-
-# Create Multithreaded Instance to monitor all subs that have a valid Flair_Helper configuration
-async def run_bot_async(reddit, bot_username):
-    # Correctly await the asynchronous function call
-    #await fetch_and_cache_configs(reddit, bot_username)  # This is adapted to be async
-    await monitor_mod_log(reddit, bot_username)
 
 
 # Check for PM's every 60 seconds
@@ -1415,51 +1350,31 @@ async def monitor_private_messages(reddit):
         await asyncio.sleep(120)  # Sleep for 60 seconds before the next iteration
 
 
+@reddit_error_handler
 async def main():
-    max_retries = 3
-    retry_delay = 30  # Delay in seconds between retries
-    max_retry_delay = 120  # Maximum delay in seconds between retries
-
     wiki_fetch_delay = 90
 
-    for attempt in range(max_retries):
-        try:
-            reddit = asyncpraw.Reddit("fh2_login")
+    reddit = asyncpraw.Reddit("fh2_login")
 
-            # Fetch the bot's username
-            me = await reddit.user.me()
-            bot_username = me.name
+    # Fetch the bot's username
+    me = await reddit.user.me()
+    bot_username = me.name
 
-            # Check if the database is empty
-            if is_database_empty():
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Database is empty. Fetching and caching configurations for all moderated subreddits.") if verbosemode else None
-                await fetch_and_cache_configs(reddit, bot_username)
-            else:
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Database contains subreddit configurations. Proceeding with the delayed fetch and cache.") if verbosemode else None
+    # Check if the database is empty
+    if is_database_empty():
+        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Database is empty. Fetching and caching configurations for all moderated subreddits.") if verbosemode else None
+        await fetch_and_cache_configs(reddit, bot_username)
+    else:
+        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Database contains subreddit configurations. Proceeding with the delayed fetch and cache.") if verbosemode else None
 
-            # Create separate tasks for each coroutine
-            bot_task = asyncio.create_task(run_bot_async(reddit, bot_username))
-            pm_task = asyncio.create_task(monitor_private_messages(reddit))
-            wiki_cache_task = asyncio.create_task(delayed_fetch_and_cache_configs(reddit, bot_username, wiki_fetch_delay))
-            mod_invites_task = asyncio.create_task(check_new_mod_invitations(reddit, bot_username))
+    # Create separate tasks for each coroutine
+    bot_task = asyncio.create_task(monitor_mod_log(reddit, bot_username))
+    pm_task = asyncio.create_task(monitor_private_messages(reddit))
+    wiki_cache_task = asyncio.create_task(delayed_fetch_and_cache_configs(reddit, bot_username, wiki_fetch_delay))
+    mod_invites_task = asyncio.create_task(check_new_mod_invitations(reddit, bot_username))
 
-            await asyncio.gather(bot_task, pm_task, wiki_cache_task, mod_invites_task)
+    await asyncio.gather(bot_task, pm_task, wiki_cache_task, mod_invites_task)
 
-            # If the bot starts successfully, break out of the retry loop
-            break
-
-        except (aiohttp.ClientConnectorError, asyncprawcore.exceptions.RequestException) as e:
-            error_message = f"main(): Error connecting to Reddit API: {str(e)}"
-            print(error_message)
-            await error_handler(error_message, notify_discord=True)
-
-            if attempt < max_retries - 1:
-                retry_delay = min(retry_delay * 2, max_retry_delay)  # Exponential backoff
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...")
-                await asyncio.sleep(retry_delay)
-            else:
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Exiting...")
-                raise
 
 if __name__ == "__main__":
     asyncio.run(main())
