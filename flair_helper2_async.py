@@ -26,7 +26,7 @@ verbosemode = False
 auto_accept_mod_invites = False
 send_pm_on_wiki_config_update = False
 
-discord_bot_notifications = False
+discord_bot_notifications = True
 discord_webhook_url = "YOUR_DISCORD_WEBHOOK_URL"
 
 logs_dir = "logs/"
@@ -61,19 +61,23 @@ def reddit_error_handler(func):
             try:
                 return await func(*args, **kwargs)
             except asyncprawcore_exceptions.ServerError:
-                await error_handler("reddit_error_handler - Error: asyncprawcore.exceptions.ServerError", notify_discord=True)
-                await asyncio.sleep(20)
+                sleep_ServerError = 120
+                await error_handler(f"reddit_error_handler - Error: asyncprawcore.exceptions.ServerError - Reddit may be down. Waiting {sleep_ServerError} seconds.", notify_discord=True)
+                await asyncio.sleep(sleep_ServerError)
             except asyncprawcore_exceptions.Forbidden:
-                await error_handler("reddit_error_handler - Error: asyncprawcore.exceptions.Forbidden", notify_discord=True)
-                await asyncio.sleep(20)
+                sleep_Forbidden = 20
+                await error_handler(f"reddit_error_handler - Error: asyncprawcore.exceptions.Forbidden - Waiting {sleep_Forbidden} seconds.", notify_discord=True)
+                await asyncio.sleep(sleep_Forbidden)
             except asyncprawcore_exceptions.ResponseException:
-                await error_handler("reddit_error_handler - Error: asyncprawcore.exceptions.ResponseException", notify_discord=True)
-                await asyncio.sleep(20)
+                sleep_ResponseException = 20
+                await error_handler(f"reddit_error_handler - Error: asyncprawcore.exceptions.ResponseException - Waiting {sleep_ResponseException} seconds.", notify_discord=True)
+                await asyncio.sleep(sleep_ResponseException)
             except asyncprawcore_exceptions.RequestException:
-                await error_handler("reddit_error_handler - Error: asyncprawcore.exceptions.RequestException", notify_discord=True)
-                await asyncio.sleep(20)
+                sleep_RequestException = 20
+                await error_handler(f"reddit_error_handler - Error: asyncprawcore.exceptions.RequestException - Waiting {sleep_RequestException} seconds.", notify_discord=True)
+                await asyncio.sleep(sleep_RequestException)
             except asyncpraw.exceptions.RedditAPIException as exception:
-                await error_handler("reddit_error_handler - Error: asyncpraw.exceptions.RedditAPIException", notify_discord=True)
+                await error_handler(f"reddit_error_handler - Error: asyncpraw.exceptions.RedditAPIException", notify_discord=True)
                 for subexception in exception.items:
                     if subexception.error_type == 'RATELIMIT':
                         message = subexception.message.replace("Looks like you've been doing that a lot. Take a break for ", "").replace("before trying again.", "")
@@ -102,8 +106,9 @@ def reddit_error_handler(func):
                     await error_handler(f"reddit_error_handler - Retry attempt {i+1} failed. Retrying in {retry_delay} seconds...  Error: {str(e)}", notify_discord=True)
                     await asyncio.sleep(retry_delay)
             else:
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Exiting...")
-                raise
+                await error_handler(f"reddit_error_handler - Max retries exceeded.", notify_discord=True)
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Exiting...") if debugmode else None
+                raise RuntimeError("Max retries exceeded in reddit_error_handler") from None
 
     return inner_function
 
@@ -326,6 +331,7 @@ def validate_and_correct_config(config):
 
 @reddit_error_handler
 async def fetch_and_cache_configs(reddit, bot_username, max_retries=3, retry_delay=1, max_retry_delay=60, single_sub=None):
+    delay_between_wiki_fetch = 1
     create_database()
     moderated_subreddits = []
     if single_sub:
@@ -429,10 +435,10 @@ async def fetch_and_cache_configs(reddit, bot_username, max_retries=3, retry_del
                             await error_handler(f"Error sending message to /r/{subreddit.display_name}: {e}", notify_discord=True)
             else:
                 print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: The Flair Helper wiki page configuration for /r/{subreddit.display_name} has not changed.") if debugmode else None
-                await asyncio.sleep(1)  # Adjust the delay as needed
+                #await asyncio.sleep(1)  # Adjust the delay as needed
             break  # Configuration loaded successfully, exit the retry loop
 
-        await asyncio.sleep(retry_delay)  # Add a delay between subreddit configurations
+        await asyncio.sleep(delay_between_wiki_fetch)  # Add a delay between subreddit configurations
 
     print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Completed checking all Wiki page configuration.") if debugmode else None
 
@@ -466,39 +472,49 @@ def add_usernote(notes, author, note_text, link, mod_index, usernote_type_index)
     notes[author]["ns"].append(new_note)
 
 @reddit_error_handler
-async def update_usernotes(subreddit, author, note_text, link, mod_name, usernote_type_name=None):
+async def update_usernotes(subreddit, author, note_text, link, mod_name, usernote_type_name=None, max_retries=3, retry_delay=5):
     async with usernotes_lock:
-        usernotes_wiki = await subreddit.wiki.get_page("usernotes")
-        usernotes_content = usernotes_wiki.content_md
-        usernotes_data = json.loads(usernotes_content)
+        for attempt in range(max_retries):
+            try:
+                usernotes_wiki = await subreddit.wiki.get_page("usernotes")
+                usernotes_content = usernotes_wiki.content_md
+                usernotes_data = json.loads(usernotes_content)
 
-        if 'blob' not in usernotes_data:
-            usernotes_data['blob'] = ''
+                if 'blob' not in usernotes_data:
+                    usernotes_data['blob'] = ''
 
-        decompressed_notes = decompress_notes(usernotes_data['blob'])
+                decompressed_notes = decompress_notes(usernotes_data['blob'])
 
-        if 'constants' not in usernotes_data:
-            usernotes_data['constants'] = {'users': [], 'warnings': []}
+                if 'constants' not in usernotes_data:
+                    usernotes_data['constants'] = {'users': [], 'warnings': []}
 
-        if mod_name not in usernotes_data['constants']['users']:
-            usernotes_data['constants']['users'].append(mod_name)
+                if mod_name not in usernotes_data['constants']['users']:
+                    usernotes_data['constants']['users'].append(mod_name)
 
-        mod_index = usernotes_data['constants']['users'].index(mod_name)
+                mod_index = usernotes_data['constants']['users'].index(mod_name)
 
-        if usernote_type_name:
-            if usernote_type_name not in usernotes_data['constants']['warnings']:
-                usernotes_data['constants']['warnings'].append(usernote_type_name)
-            usernote_type_index = usernotes_data['constants']['warnings'].index(usernote_type_name)
-        else:
-            usernote_type_index = 0  # Use the default index if usernote_type_name is not provided
+                if usernote_type_name:
+                    if usernote_type_name not in usernotes_data['constants']['warnings']:
+                        usernotes_data['constants']['warnings'].append(usernote_type_name)
+                    usernote_type_index = usernotes_data['constants']['warnings'].index(usernote_type_name)
+                else:
+                    usernote_type_index = 0  # Use the default index if usernote_type_name is not provided
 
-        add_usernote(decompressed_notes, author, note_text, link, mod_index, usernote_type_index)
+                add_usernote(decompressed_notes, author, note_text, link, mod_index, usernote_type_index)
 
-        usernotes_data['blob'] = compress_notes(decompressed_notes)
+                usernotes_data['blob'] = compress_notes(decompressed_notes)
 
-        compressed_notes = json.dumps(usernotes_data)
-        edit_reason = f"note added on user {author} via flair_helper2"
-        await usernotes_wiki.edit(content=compressed_notes, reason=edit_reason)
+                compressed_notes = json.dumps(usernotes_data)
+                edit_reason = f"note added on user {author} via flair_helper2"
+                await usernotes_wiki.edit(content=compressed_notes, reason=edit_reason)
+                break  # Exit the retry loop if the update is successful
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                else:
+                    error_message = f"Failed to update usernotes for user {author}"
+                    print(error_message) if debugmode else None
+                    raise RuntimeError(error_message) from e
 
 
 
@@ -607,6 +623,8 @@ async def process_flair_assignment(reddit, log_entry, config, subreddit, max_ret
                 try:
                     # Retrieve the flair details from the configuration
                     flair_details = next(flair for flair in config[1:] if flair['templateId'] == flair_guid)
+
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair details: {flair_details}") if verbosemode else None
 
                     await post.load()
                     # Now that post data is loaded, ensure that author data is loaded
@@ -1246,7 +1264,6 @@ async def create_auto_flairhelper_wiki(reddit, subreddit, mode):
         final_output = json_output
 
     print(f"\n\nFormatted JSON Output Message:\n\n{json_output}\n\n") if verbosemode else None
-
     return final_output
 
 
@@ -1288,9 +1305,24 @@ async def check_new_mod_invitations(reddit, bot_username):
         await asyncio.sleep(3600)  # Check for new mod invitations every hour (adjust as needed)
 
 
+last_startup_time_MonitorModLog = None
+
 # Primary Mod Log Monitor
 @reddit_error_handler
-async def monitor_mod_log(reddit, bot_username):
+async def monitor_mod_log(reddit, bot_username, max_concurrency=2):
+
+    global last_startup_time_MonitorModLog
+
+    current_time = time.time()
+    if last_startup_time_MonitorModLog is not None:
+        elapsed_time = current_time - last_startup_time_MonitorModLog
+        if elapsed_time < 10:  # Check if the bot restarted within the last 10 seconds
+            delay = 10 - elapsed_time
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Bot restarted within 10 seconds. Waiting for {delay} seconds before proceeding.")
+            await asyncio.sleep(delay)
+
+    last_startup_time_MonitorModLog = current_time
+
     accounts_to_ignore = ['AssistantBOT1', 'anyadditionalacctshere', 'thatmayinteractwithflair']
 
     print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair Helper 2 has started up successfully!\nBot username: {bot_username}") if verbosemode else None
@@ -1309,6 +1341,15 @@ async def monitor_mod_log(reddit, bot_username):
 
     await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair Helper 2 has started up successfully!\nBot username: **{bot_username}**\n\n{bot_username} moderates subreddits:\n   {formatted_subreddits}")
 
+    semaphore = asyncio.Semaphore(max_concurrency)
+
+    async def process_flair_edit(log_entry):
+        async with semaphore:
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair action detected by {log_entry.mod} in /r/{log_entry.subreddit}") if debugmode else None
+            subreddit_instance = await reddit.subreddit(log_entry.subreddit)
+            config = get_cached_config(log_entry.subreddit)
+            await process_flair_assignment(reddit, log_entry, config, subreddit_instance)
+
     while True:
         subreddit = await reddit.subreddit("mod")
         async for log_entry in subreddit.mod.stream.log(skip_existing=True):
@@ -1323,42 +1364,63 @@ async def monitor_mod_log(reddit, bot_username):
                         error_output = f"monitor_mod_log: Flair Helper wiki page not found in /r/{log_entry.subreddit}"
                         print(error_output) if debugmode else None
                         errors_logger.error(error_output)
+
             elif (log_entry.action == 'editflair'
                 and log_entry.mod not in accounts_to_ignore
                 and log_entry.target_fullname is not None
                 and log_entry.target_fullname.startswith('t3_')):
                 # This is a link (submission) flair edit
-                    # Get the post object
-                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair action detected by {log_entry.mod} in /r/{log_entry.subreddit}") if debugmode else None
-                    subreddit_instance = await reddit.subreddit(log_entry.subreddit)
-                    config = get_cached_config(log_entry.subreddit)
-                    await process_flair_assignment(reddit, log_entry, config, subreddit_instance)  # Ensure process_flair_assignment is also async
+                loop = asyncio.get_running_loop()
+                loop.create_task(process_flair_edit(log_entry))
+
             else:
                 print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Ignoring action: {log_entry.action} in /r/{log_entry.subreddit}") if verbosemode else None
 
 
+@reddit_error_handler
 async def delayed_fetch_and_cache_configs(reddit, bot_username, delay):
     await asyncio.sleep(delay)  # Wait for the specified delay
+    #print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: fetch_and_cache_configs skipped during testing.") if debugmode else None
     print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Waited {delay}, Now processing fetch_and_cache_configs.") if debugmode else None
     await fetch_and_cache_configs(reddit, bot_username)  # Fetch and cache configurations
 
 
 # Check for PM's every 60 seconds
+@reddit_error_handler
 async def monitor_private_messages(reddit):
     while True:
         await handle_private_messages(reddit)
         await asyncio.sleep(120)  # Sleep for 60 seconds before the next iteration
 
 
+last_startup_time_main = None
+
 @reddit_error_handler
 async def main():
+    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair Helper 2 entered main()") if debugmode else None
+
+    global last_startup_time_main
+
+    current_time = time.time()
+    if last_startup_time_main is not None:
+        elapsed_time = current_time - last_startup_time_main
+        if elapsed_time < 10:  # Check if the bot restarted within the last 10 seconds
+            delay = 10 - elapsed_time
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Bot restarted within 10 seconds. Waiting for {delay} seconds before proceeding.")
+            await asyncio.sleep(delay)
+
+    last_startup_time_main = current_time
+
     wiki_fetch_delay = 90
 
+    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair Helper 2 initializing asyncpraw") if debugmode else None
     reddit = asyncpraw.Reddit("fh2_login")
 
     # Fetch the bot's username
+    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair Helper 2 fetching bot_username") if debugmode else None
     me = await reddit.user.me()
     bot_username = me.name
+    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair Helper 2 fetched Bot username: {bot_username}") if debugmode else None
 
     # Check if the database is empty
     if is_database_empty():
@@ -1377,4 +1439,5 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    #asyncio.run(main())
+    asyncio.get_event_loop().run_until_complete(main())
