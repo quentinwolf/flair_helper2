@@ -26,7 +26,7 @@ verbosemode = False
 auto_accept_mod_invites = False
 send_pm_on_wiki_config_update = False
 
-discord_bot_notifications = True
+discord_bot_notifications = False
 discord_webhook_url = "YOUR_DISCORD_WEBHOOK_URL"
 
 logs_dir = "logs/"
@@ -51,12 +51,12 @@ async def error_handler(error_message, notify_discord=False):
 
 # Error handler by u/ParkingPsychology https://www.reddit.com/r/redditdev/comments/xtrvb7/praw_how_to_handle/iqupaxz/
 def reddit_error_handler(func):
-    max_retries = 5
-    retry_delay = 5  # Delay in seconds between retries
-    max_retry_delay = 120  # Maximum delay in seconds between retries
 
     async def inner_function(*args, **kwargs):
         max_retries = 3
+        retry_delay = 5
+        max_retry_delay = 120
+
         for attempt in range(max_retries):
             try:
                 return await func(*args, **kwargs)
@@ -93,8 +93,10 @@ def reddit_error_handler(func):
                         await error_handler(f"reddit_error_handler - Different Error: {subexception}", notify_discord=True)
                 await asyncio.sleep(retry_delay)
             except Exception as e:
-                await error_handler(f"reddit_error_handler - Unexpected Error: {str(e)}", notify_discord=True)
-                await asyncio.sleep(retry_delay)
+                error_message = f"reddit_error_handler - Unexpected Error: {str(e)}"
+                print(error_message)
+                print(traceback.format_exc())  # Print the traceback
+                await error_handler(error_message, notify_discord=True)
 
         # Retry loop
         for i in range(max_retries):
@@ -123,7 +125,7 @@ async def get_subreddit(reddit, subreddit_name):
 
 
 # Create local sqlite db to cache/store Wiki Configs for all subs ones bot moderates
-def create_database():
+def create_configs_database():
     conn = sqlite3.connect('flair_helper_configs.db')
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS configs
@@ -163,7 +165,7 @@ def get_stored_subreddits():
     return stored_subreddits
 
 
-def is_database_empty():
+def is_config_database_empty():
     conn = sqlite3.connect('flair_helper_configs.db')
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='configs'")
@@ -177,7 +179,6 @@ def is_database_empty():
         conn.close()
         return True
 
-
 @reddit_error_handler
 async def get_latest_wiki_revision(subreddit):
     try:
@@ -190,6 +191,64 @@ async def get_latest_wiki_revision(subreddit):
         # Handle exceptions appropriately
         print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error fetching latest wiki revision: {e}")
     return None
+
+
+def create_actions_database():
+    conn = sqlite3.connect('flair_helper_actions.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS actions
+                 (submission_id TEXT,
+                  action TEXT,
+                  completed INTEGER,
+                  mod_name TEXT)''')
+    conn.commit()
+    conn.close()
+
+def insert_actions_to_database(submission_id, actions, mod_name):
+    conn = sqlite3.connect('flair_helper_actions.db')
+    c = conn.cursor()
+    for action in actions:
+        c.execute("INSERT INTO actions VALUES (?, ?, ?, ?)", (submission_id, action, 0, mod_name))
+    conn.commit()
+    conn.close()
+
+def get_pending_submission_ids_from_database():
+    conn = sqlite3.connect('flair_helper_actions.db')
+    c = conn.cursor()
+    c.execute("SELECT DISTINCT submission_id, mod_name FROM actions WHERE completed = 0")
+    pending_submission_ids = c.fetchall()
+    conn.close()
+    return pending_submission_ids
+
+def mark_action_as_completed(submission_id, action):
+    conn = sqlite3.connect('flair_helper_actions.db')
+    c = conn.cursor()
+    c.execute("UPDATE actions SET completed = 1 WHERE submission_id = ? AND action = ?", (submission_id, action))
+    conn.commit()
+    conn.close()
+
+def is_action_completed(submission_id, action):
+    conn = sqlite3.connect('flair_helper_actions.db')
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM actions WHERE submission_id = ? AND action = ? AND completed = 1", (submission_id, action))
+    completed_count = c.fetchone()[0]
+    conn.close()
+    return completed_count > 0
+
+def is_submission_completed(submission_id):
+    conn = sqlite3.connect('flair_helper_actions.db')
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM actions WHERE submission_id = ? AND completed = 0", (submission_id,))
+    pending_count = c.fetchone()[0]
+    conn.close()
+    return pending_count == 0
+
+def delete_completed_actions(submission_id):
+    conn = sqlite3.connect('flair_helper_actions.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM actions WHERE submission_id = ? AND completed = 1", (submission_id,))
+    conn.commit()
+    conn.close()
 
 
 def convert_yaml_to_json(yaml_config):
@@ -332,7 +391,7 @@ def validate_and_correct_config(config):
 @reddit_error_handler
 async def fetch_and_cache_configs(reddit, bot_username, max_retries=3, retry_delay=1, max_retry_delay=60, single_sub=None):
     delay_between_wiki_fetch = 1
-    create_database()
+    create_configs_database()
     moderated_subreddits = []
     if single_sub:
         moderated_subreddits.append(await get_subreddit(reddit, single_sub))
@@ -595,492 +654,505 @@ async def fetch_user_flair(subreddit, username):
 
 # Primary process to handle any flair changes that appear in the logs
 @reddit_error_handler
-async def process_flair_assignment(reddit, log_entry, config, subreddit, max_retries=3, retry_delay=5):
-    target_fullname = log_entry.target_fullname
-    if target_fullname.startswith('t3_'):  # Check if it's a submission
+async def process_flair_assignment(reddit, post, config, subreddit, mod_name, max_retries=3, retry_delay=5):
+
+    #submission_id = target_fullname[3:]  # Remove the 't3_' prefix
+    #post = await reddit.submission(submission_id)
+    flair_guid = getattr(post, 'link_flair_template_id', None)  # Use getattr to safely retrieve the attribute
+    flair_details = next((flair for flair in config[1:] if flair['templateId'] == flair_guid), None)
+
+    if flair_details is None:
+        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair GUID {flair_guid} not found in the configuration for /r/{subreddit.display_name}") if debugmode else None
+        return
+
+    submission_id = post.id
+
+    # Get the post title and author for debugging
+    post_author_name = post.author.name if post.author else "[deleted]"
+    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair GUID {flair_guid} detected on ID: {submission_id} on post '{post.title}' by {post_author_name} in /r/{subreddit.display_name}") if debugmode else None
+    # boolean variable to track whether the author is deleted or suspended:
+    is_author_deleted_or_suspended = post_author_name == "[deleted]"
+
+    # Reload the configuration from the database
+    config = get_cached_config(subreddit.display_name)
 
 
-        submission_id = target_fullname[3:]  # Remove the 't3_' prefix
-        post = await reddit.submission(submission_id)
-        flair_guid = getattr(post, 'link_flair_template_id', None)  # Use getattr to safely retrieve the attribute
-        # Get the post title and author for debugging
-        post_author_name = post.author.name if post.author else "[deleted]"
-        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair GUID {flair_guid} detected on ID: {submission_id} on post '{post.title}' by {post_author_name} in /r/{subreddit.display_name}") if debugmode else None
-        # boolean variable to track whether the author is deleted or suspended:
-        is_author_deleted_or_suspended = post_author_name == "[deleted]"
+    if config is None:
+        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Configuration not found for /r/{subreddit.display_name}. Skipping flair assignment.")
+        return
 
-        # Reload the configuration from the database
-        config = get_cached_config(subreddit.display_name)
+    if flair_guid and any(flair['templateId'] == flair_guid for flair in config[1:]):
 
+        for attempt in range(max_retries):
+            try:
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair details: {flair_details}") if verbosemode else None
 
-        if config is None:
-            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Configuration not found for /r/{subreddit.display_name}. Skipping flair assignment.")
+                await post.load()
+                # Now that post data is loaded, ensure that author data is loaded
+                if post.author:
+                    await post.author.load()
+                    if hasattr(post.author, 'is_suspended') and post.author.is_suspended:
+                        author_id = None
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Skipping author ID on ID: {submission_id} for suspended user: {post.author.name}") if debugmode else None
+                    else:
+                        author_id = post.author.id
+                else:
+                    # Handle the case where the post may not have an author (e.g., deleted account)
+                    author_id = None
+
+                if post.subreddit:
+                    await post.subreddit.load()
+                    subreddit_id = post.subreddit.id
+                else:
+                    # Handle the case where the post may not have an author (e.g., deleted account)
+                    subreddit_id = None
+
+                # Only fetch the current flair if the author is not deleted or suspended
+                if not is_author_deleted_or_suspended:
+                    current_flair = await fetch_user_flair(subreddit, post.author.name)  # Fetch the current flair asynchronously
+                else:
+                    current_flair = None
+
+            except asyncprawcore.exceptions.RequestException as e:
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment attempt: Error connecting to Reddit API: {str(e)}") if debugmode else None
+                if attempt < max_retries - 1:
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
+                    await asyncio.sleep(retry_delay)
+                else:
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded.") if debugmode else None
+                    await error_handler(f"process_flair_assignment: Error processing flair for {post_author_name} in /r/{subreddit.display_name}: {e}", notify_discord=True)
+                    # Submission detailed failed to low return from function.
+                    return
+
+        # Initialize defaults if the user has no current flair
+        flair_text = ''
+        flair_css_class = ''
+
+        if current_flair:
+            flair_text = current_flair.get('flair_text', '')
+            flair_css_class = current_flair.get('flair_css_class', '')
+
+        # Format the header, flair details, and footer with the placeholders
+        formatted_header = config[0]['GeneralConfiguration']['header']
+        formatted_footer = config[0]['GeneralConfiguration']['footer']
+        skip_add_newlines = config[0]['GeneralConfiguration'].get('skip_add_newlines', False)
+        require_config_to_edit = config[0]['GeneralConfiguration'].get('require_config_to_edit', False)
+        ignore_same_flair_seconds = config[0]['GeneralConfiguration'].get('ignore_same_flair_seconds', 60)
+        utc_offset = config[0]['GeneralConfiguration'].get('utc_offset', 0)
+        custom_time_format = config[0]['GeneralConfiguration'].get('custom_time_format', '')
+
+        if not skip_add_newlines:
+            formatted_header += "\n\n"
+            formatted_footer = "\n\n" + formatted_footer
+
+        last_flair_time = getattr(post, '_last_flair_time', 0)
+        if time.time() - last_flair_time < ignore_same_flair_seconds:
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Ignoring same flair action on ID: {submission_id} within {ignore_same_flair_seconds} seconds") if debugmode else None
             return
+        post._last_flair_time = time.time()
 
-        if flair_guid and any(flair['templateId'] == flair_guid for flair in config[1:]):
+        now = datetime.utcnow() + timedelta(hours=utc_offset)
+        created_time = datetime.utcfromtimestamp(post.created_utc) + timedelta(hours=utc_offset)
 
+        placeholders = {
+            'time_unix': int(now.timestamp()),
+            'time_iso': now.isoformat(),
+            'time_custom': now.strftime(custom_time_format) if custom_time_format else '',
+            'created_unix': int(created_time.timestamp()),
+            'created_iso': created_time.isoformat(),
+            'created_custom': created_time.strftime(custom_time_format) if custom_time_format else ''
+        }
+
+        # Create a dictionary to store the placeholder values
+        placeholders.update({
+            'author': post_author_name,
+            'subreddit': post.subreddit.display_name,
+            'body': post.selftext,
+            'title': post.title,
+            'id': post.id,
+            'permalink': post.permalink,
+            'url': post.permalink,
+            'domain': post.domain,
+            'link': post.url,
+            'kind': 'submission',
+            'mod': mod_name,
+            'author_flair_text': post.author_flair_text if post.author_flair_text else '',
+            'author_flair_css_class': post.author_flair_css_class if post.author_flair_css_class else '',
+            'author_flair_template_id': post.author_flair_template_id if post.author_flair_template_id else '',
+            'link_flair_text': post.link_flair_text if post.link_flair_text else '',
+            'link_flair_css_class': post.link_flair_css_class if post.link_flair_css_class else '',
+            'link_flair_template_id': post.link_flair_template_id if post.link_flair_template_id else '',
+            'author_id': author_id,
+            'subreddit_id': post.subreddit.id
+        })
+
+        for placeholder, value in placeholders.items():
+            formatted_header = formatted_header.replace(f"{{{{{placeholder}}}}}", str(value))
+            formatted_footer = formatted_footer.replace(f"{{{{{placeholder}}}}}", str(value))
+
+        # Replace placeholders in specific flair_details values
+        formatted_flair_details = flair_details['notes']
+        for placeholder, value in placeholders.items():
+            formatted_flair_details = formatted_flair_details.replace(f"{{{{{placeholder}}}}}", str(value))
+
+        removal_reason = f"{formatted_header}\n\n{formatted_flair_details}\n\n{formatted_footer}"
+
+        # Execute the configured actions
+        if not is_action_completed(submission_id, 'approve') and 'approve' in flair_details and flair_details['approve']:
             for attempt in range(max_retries):
                 try:
-                    # Retrieve the flair details from the configuration
-                    flair_details = next(flair for flair in config[1:] if flair['templateId'] == flair_guid)
-
-                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair details: {flair_details}") if verbosemode else None
-
-                    await post.load()
-                    # Now that post data is loaded, ensure that author data is loaded
-                    if post.author:
-                        await post.author.load()
-                        if hasattr(post.author, 'is_suspended') and post.author.is_suspended:
-                            author_id = None
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Skipping author ID on ID: {submission_id} for suspended user: {post.author.name}") if debugmode else None
-                        else:
-                            author_id = post.author.id
-                    else:
-                        # Handle the case where the post may not have an author (e.g., deleted account)
-                        author_id = None
-
-                    if post.subreddit:
-                        await post.subreddit.load()
-                        subreddit_id = post.subreddit.id
-                    else:
-                        # Handle the case where the post may not have an author (e.g., deleted account)
-                        subreddit_id = None
-
-                    # Only fetch the current flair if the author is not deleted or suspended
-                    if not is_author_deleted_or_suspended:
-                        current_flair = await fetch_user_flair(subreddit, post.author.name)  # Fetch the current flair asynchronously
-                    else:
-                        current_flair = None
-
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Approve triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Submission approved on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
+                    await post.mod.approve()
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Submission unlocked on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
+                    await post.mod.unlock()
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Spoiler removed on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
+                    await post.mod.unspoiler()
+                    mark_action_as_completed(submission_id, 'approve')
                 except asyncprawcore.exceptions.RequestException as e:
-                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment attempt: Error connecting to Reddit API: {str(e)}") if debugmode else None
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment approve: Error connecting to Reddit API: {str(e)}") if debugmode else None
                     if attempt < max_retries - 1:
                         print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
                         await asyncio.sleep(retry_delay)
                     else:
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded.") if debugmode else None
-                        await error_handler(f"process_flair_assignment: Error processing flair for {post_author_name} in /r/{subreddit.display_name}: {e}", notify_discord=True)
-                        # Submission detailed failed to low return from function.
-                        return
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Skipping approve action...") if debugmode else None
+                        await error_handler(f"process_flair_assignment: Error Approving Post ID: {submission_id} in /r/{subreddit.display_name}: {e}", notify_discord=True)
+                break
 
-            # Initialize defaults if the user has no current flair
-            flair_text = ''
-            flair_css_class = ''
+        if not is_action_completed(submission_id, 'remove') and 'remove' in flair_details and flair_details['remove']:
+            for attempt in range(max_retries):
+                try:
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: remove triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
+                    mod_note = flair_details['usernote']['note'][:100] if 'usernote' in flair_details and flair_details['usernote']['enabled'] else ''
 
-            if current_flair:
-                flair_text = current_flair.get('flair_text', '')
-                flair_css_class = current_flair.get('flair_css_class', '')
+                    if flair_details.get('modlogReason'):
+                        mod_note = flair_details['modlogReason'][:100]  # Truncate to 100 characters
 
-            # Format the header, flair details, and footer with the placeholders
-            formatted_header = config[0]['GeneralConfiguration']['header']
-            formatted_footer = config[0]['GeneralConfiguration']['footer']
-            skip_add_newlines = config[0]['GeneralConfiguration'].get('skip_add_newlines', False)
-            require_config_to_edit = config[0]['GeneralConfiguration'].get('require_config_to_edit', False)
-            ignore_same_flair_seconds = config[0]['GeneralConfiguration'].get('ignore_same_flair_seconds', 60)
-            utc_offset = config[0]['GeneralConfiguration'].get('utc_offset', 0)
-            custom_time_format = config[0]['GeneralConfiguration'].get('custom_time_format', '')
+                    await post.mod.remove(spam=False, mod_note=mod_note)
+                    mark_action_as_completed(submission_id, 'remove')
+                    mark_action_as_completed(submission_id, 'modlogReason')
+                except asyncprawcore.exceptions.RequestException as e:
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment remove: Error connecting to Reddit API: {str(e)}") if debugmode else None
+                    if attempt < max_retries - 1:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
+                        await asyncio.sleep(retry_delay)
+                    else:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Skipping remove action...") if debugmode else None
+                        await error_handler(f"process_flair_assignment: Error Removing Post ID: {submission_id} in /r/{subreddit.display_name}: {e}", notify_discord=True)
+                break
 
-            if not skip_add_newlines:
-                formatted_header += "\n\n"
-                formatted_footer = "\n\n" + formatted_footer
+        if not flair_details.get('remove') and not is_action_completed(submission_id, 'modlogReason') and flair_details.get('modlogReason'):
+            for attempt in range(max_retries):
+                try:
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: modlogReason triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
+                    await post.mod.create_note(note=flair_details['modlogReason'][:250])  # Truncate to 250 characters
+                    mark_action_as_completed(submission_id, 'modlogReason')
+                except asyncprawcore.exceptions.RequestException as e:
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment remove_modlogreason: Error connecting to Reddit API: {str(e)}") if debugmode else None
+                    if attempt < max_retries - 1:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
+                        await asyncio.sleep(retry_delay)
+                    else:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Skipping create_note action...") if debugmode else None
+                        await error_handler(f"process_flair_assignment: Error Creating Mod Note for ID: {submission_id} in /r/{subreddit.display_name}: {e}", notify_discord=True)
+                break
 
-            last_flair_time = getattr(post, '_last_flair_time', 0)
-            if time.time() - last_flair_time < ignore_same_flair_seconds:
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Ignoring same flair action on ID: {submission_id} within {ignore_same_flair_seconds} seconds") if debugmode else None
-                return
-            post._last_flair_time = time.time()
+        if not is_action_completed(submission_id, 'comment') and 'comment' in flair_details and flair_details['comment']['enabled']:
+            post_age_days = (datetime.utcnow() - datetime.utcfromtimestamp(post.created_utc)).days
+            max_age = config[0]['GeneralConfiguration'].get('maxAgeForComment', 175)
+            if post_age_days <= max_age:
+                comment_body = flair_details['comment'].get('body', '')
+                if comment_body.strip():
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: comment triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
+                    for attempt in range(max_retries):
+                        try:
+                            if flair_details['remove']:
+                                # If both 'remove' and 'comment' are configured for the flair GUID
+                                removal_type = config[0]['GeneralConfiguration'].get('removal_comment_type', '')
+                                if removal_type == '':
+                                    removal_type = 'public_as_subreddit'  # Default to 'public' if removal_comment_type is blank or unset
+                                elif removal_type not in ['public', 'private', 'private_exposed', 'public_as_subreddit']:
+                                    removal_type = 'public_as_subreddit'  # Use 'public' as the default if an invalid value is provided
+                                try:
+                                    await post.mod.send_removal_message(message=removal_reason, type=removal_type)
+                                except asyncpraw.exceptions.RedditAPIException as e:
+                                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error sending removal message for post ID: {submission_id} in /r/{subreddit.display_name}: {e}")
+                            else:
+                                    # If only 'comment' is configured for the flair GUID
+                                    comment = await post.reply(removal_reason)
+                                    if flair_details['comment']['stickyComment']:
+                                        await comment.mod.distinguish(sticky=True)
+                                    if flair_details['comment']['lockComment']:
+                                        await comment.mod.lock()
+                            mark_action_as_completed(submission_id, 'comment')
+                        except asyncprawcore.exceptions.RequestException as e:
+                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment comment: Error connecting to Reddit API: {str(e)}") if debugmode else None
+                            if attempt < max_retries - 1:
+                                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
+                                await asyncio.sleep(retry_delay)
+                            else:
+                                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Skipping comment action...") if debugmode else None
+                                await error_handler(f"process_flair_assignment: Error Commenting on Post ID: {submission_id} in /r/{subreddit.display_name}: {e}", notify_discord=True)
+                                #return # exit the process_flair_assignment function and proceed to next modlog
+                        break # exit the try loop and proceed
+                else:
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Skipping comment action due to empty comment body on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
 
-            now = datetime.utcnow() + timedelta(hours=utc_offset)
-            created_time = datetime.utcfromtimestamp(post.created_utc) + timedelta(hours=utc_offset)
-            actioned_time = datetime.utcfromtimestamp(log_entry.created_utc) + timedelta(hours=utc_offset)
+        if not is_action_completed(submission_id, 'lock') and 'lock' in flair_details and flair_details['lock']:
+            for attempt in range(max_retries):
+                try:
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: lock triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
+                    await post.mod.lock()
+                    mark_action_as_completed(submission_id, 'lock')
+                except asyncprawcore.exceptions.RequestException as e:
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment lock: Error connecting to Reddit API: {str(e)}") if debugmode else None
+                    if attempt < max_retries - 1:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
+                        await asyncio.sleep(retry_delay)
+                    else:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Skipping lock action...") if debugmode else None
+                        await error_handler(f"process_flair_assignment: Error Locking Post ID: {submission_id} in /r/{subreddit.display_name}: {e}", notify_discord=True)
+                break
 
-            placeholders = {
-                'time_unix': int(now.timestamp()),
-                'time_iso': now.isoformat(),
-                'time_custom': now.strftime(custom_time_format) if custom_time_format else '',
-                'created_unix': int(created_time.timestamp()),
-                'created_iso': created_time.isoformat(),
-                'created_custom': created_time.strftime(custom_time_format) if custom_time_format else '',
-                'actioned_unix': int(actioned_time.timestamp()),
-                'actioned_iso': actioned_time.isoformat(),
-                'actioned_custom': actioned_time.strftime(custom_time_format) if custom_time_format else ''
-            }
+        if not is_action_completed(submission_id, 'spoiler') and 'spoiler' in flair_details and flair_details['spoiler']:
+            for attempt in range(max_retries):
+                try:
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: spoiler triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
+                    await post.mod.spoiler()
+                    mark_action_as_completed(submission_id, 'spoiler')
+                except asyncprawcore.exceptions.RequestException as e:
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment spoiler: Error connecting to Reddit API: {str(e)}") if debugmode else None
+                    if attempt < max_retries - 1:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
+                        await asyncio.sleep(retry_delay)
+                    else:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Skipping spoiler action...") if debugmode else None
+                        await error_handler(f"process_flair_assignment: Error Spoilering Post ID: {submission_id} in /r/{subreddit.display_name}: {e}", notify_discord=True)
+                break
 
-            # Create a dictionary to store the placeholder values
-            placeholders.update({
-                'author': post_author_name,
-                'subreddit': post.subreddit.display_name,
-                'body': post.selftext,
-                'title': post.title,
-                'id': post.id,
-                'permalink': post.permalink,
-                'url': post.permalink,
-                'domain': post.domain,
-                'link': post.url,
-                'kind': 'submission',
-                'mod': log_entry.mod.name,
-                'author_flair_text': post.author_flair_text if post.author_flair_text else '',
-                'author_flair_css_class': post.author_flair_css_class if post.author_flair_css_class else '',
-                'author_flair_template_id': post.author_flair_template_id if post.author_flair_template_id else '',
-                'link_flair_text': post.link_flair_text if post.link_flair_text else '',
-                'link_flair_css_class': post.link_flair_css_class if post.link_flair_css_class else '',
-                'link_flair_template_id': post.link_flair_template_id if post.link_flair_template_id else '',
-                'author_id': author_id,
-                'subreddit_id': post.subreddit.id
-            })
+        if not is_action_completed(submission_id, 'clearPostFlair') and 'clearPostFlair' in flair_details and flair_details['clearPostFlair']:
+            for attempt in range(max_retries):
+                try:
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: remove_link_flair triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
+                    await post.mod.flair(text='', css_class='')
+                    mark_action_as_completed(submission_id, 'clearPostFlair')
+                except asyncprawcore.exceptions.RequestException as e:
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment clearPostFlair: Error connecting to Reddit API: {str(e)}") if debugmode else None
+                    if attempt < max_retries - 1:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
+                        await asyncio.sleep(retry_delay)
+                    else:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Skipping remove link flair action...") if debugmode else None
+                        await error_handler(f"process_flair_assignment: Error Removing Link Flair on Post ID: {submission_id} in /r/{subreddit.display_name}: {e}", notify_discord=True)
+                break
 
-            for placeholder, value in placeholders.items():
-                formatted_header = formatted_header.replace(f"{{{{{placeholder}}}}}", str(value))
-                formatted_footer = formatted_footer.replace(f"{{{{{placeholder}}}}}", str(value))
+        if not is_action_completed(submission_id, 'sendToWebhook') and 'sendToWebhook' in flair_details and flair_details['sendToWebhook']:
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: send_to_webhook triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
+            # Send webhook notification
+            send_webhook_notification(config, post, flair_text, mod_name, flair_guid)
+            mark_action_as_completed(submission_id, 'sendToWebhook')
 
-            # Replace placeholders in specific flair_details values
-            formatted_flair_details = flair_details['notes']
-            for placeholder, value in placeholders.items():
-                formatted_flair_details = formatted_flair_details.replace(f"{{{{{placeholder}}}}}", str(value))
 
-            removal_reason = f"{formatted_header}\n\n{formatted_flair_details}\n\n{formatted_footer}"
+        # Only process the below if not suspended or deleted
+        if not is_author_deleted_or_suspended:
 
-            # Execute the configured actions
-            if 'approve' in flair_details and flair_details['approve']:
+            # Check if banning is configured for the flair GUID
+            if not is_action_completed(submission_id, 'ban') and 'ban' in flair_details and flair_details['ban']['enabled']:
+                ban_duration = flair_details['ban'].get('duration', '')
+                ban_message = flair_details['ban']['message']
+                ban_reason = flair_details['ban']['modNote']
+
+                if ban_message:
+                    for placeholder, value in placeholders.items():
+                        ban_message = ban_message.replace(f"{{{{{placeholder}}}}}", str(value))
+
+                if ban_reason:
+                    for placeholder, value in placeholders.items():
+                        ban_reason = ban_reason.replace(f"{{{{{placeholder}}}}}", str(value))[:100]
+
                 for attempt in range(max_retries):
                     try:
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Approve triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Submission approved on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
-                        await post.mod.approve()
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Submission unlocked on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
-                        await post.mod.unlock()
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Spoiler removed on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
-                        await post.mod.unspoiler()
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Debugging: ban_duration={ban_duration}, ban_message={ban_message}, ban_reason={ban_reason}") if debugmode else None
+                        if ban_duration == '' or ban_duration is True:
+                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: permanent ban triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
+                            await subreddit.banned.add(post.author, ban_message=ban_message, ban_reason=ban_reason)
+                            mark_action_as_completed(submission_id, 'ban')
+                        elif isinstance(ban_duration, int) and ban_duration > 0:
+                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Temporary ban triggered on ID: {submission_id} for {ban_duration} days in /r/{subreddit.display_name}") if debugmode else None
+                            await subreddit.banned.add(post.author, ban_message=ban_message, ban_reason=ban_reason, duration=ban_duration)
+                            mark_action_as_completed(submission_id, 'ban')
+                        else:
+                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Skipping ban action due to invalid ban duration on ID: {submission_id} for flair GUID: {flair_details['templateId']} in /r/{subreddit.display_name}") if debugmode else None
+                    except asyncprawcore.exceptions.NotFound:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: User not found for banning on ID: {submission_id} in /r/{subreddit.display_name}")
                     except asyncprawcore.exceptions.RequestException as e:
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment approve: Error connecting to Reddit API: {str(e)}") if debugmode else None
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment ban: Error connecting to Reddit API: {str(e)}") if debugmode else None
+                        if attempt < max_retries - 1:
+                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
+                            await asyncio.sleep(retry_delay)
+                        else:
+                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Skipping ban action...") if debugmode else None
+                            await error_handler(f"process_flair_assignment: Error Banning User under Post ID: {submission_id} in /r/{subreddit.display_name}: {e}", notify_discord=True)
+                    except Exception as e:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error banning user on ID: {submission_id} in /r/{subreddit.display_name}: {e}")
+                    break
+
+            if not is_action_completed(submission_id, 'unban') and 'unban' in flair_details and flair_details['unban']:
+                for attempt in range(max_retries):
+                    try:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: unban triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
+                        await subreddit.banned.remove(post.author)
+                        mark_action_as_completed(submission_id, 'unban')
+                    except asyncprawcore.exceptions.NotFound:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: User not found for unbanning on ID: {submission_id} in /r/{subreddit.display_name}")
+                    except asyncprawcore.exceptions.RequestException as e:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment unban: Error connecting to Reddit API: {str(e)}") if debugmode else None
+                        if attempt < max_retries - 1:
+                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
+                            await asyncio.sleep(retry_delay)
+                        else:
+                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Skipping approve action...") if debugmode else None
+                            await error_handler(f"process_flair_assignment: Error Unbanning user {post_author_name} in /r/{subreddit.display_name}: {e}", notify_discord=True)
+                    except Exception as e:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error unbanning user on ID: {submission_id} in /r/{subreddit.display_name}: {e}")
+                    break
+
+
+            if not is_action_completed(submission_id, 'userFlair') and 'userFlair' in flair_details and flair_details['userFlair']['enabled']:
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: set_author_flair triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
+
+                debug_current_Flair = f"{post_author_name} Current flair: text='{flair_text}', css_class='{flair_css_class}' |"
+                # Update the flair text based on the configuration
+                if flair_details['userFlair']['text']:
+                    flair_text = flair_details['userFlair']['text']
+                    for placeholder, value in placeholders.items():
+                        flair_text = flair_text.replace(f"{{{{{placeholder}}}}}", str(value))
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Updating flair text to: '{flair_text}'") if verbosemode else None
+
+                # Update the flair CSS class based on the configuration
+                if flair_details['userFlair']['cssClass']:
+                    flair_css_class = flair_details['userFlair']['cssClass']
+                    for placeholder, value in placeholders.items():
+                        flair_css_class = flair_css_class.replace(f"{{{{{placeholder}}}}}", str(value))
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Updating flair CSS class to: '{flair_css_class}'") if verbosemode else None
+
+                # Set the updated flair for the user
+                for attempt in range(max_retries):
+                    try:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: {debug_current_Flair} Updated to text='{flair_text}', css_class='{flair_css_class}'") if debugmode else None
+                        await subreddit.flair.set(post.author.name, text=flair_text, css_class=flair_css_class)
+                        mark_action_as_completed(submission_id, 'userFlair')
+                    except asyncprawcore.exceptions.NotFound:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: User not found for setting user flair on ID: {submission_id} in /r/{subreddit.display_name}")
+                    except asyncprawcore.exceptions.RequestException as e:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment userFlair: Error connecting to Reddit API: {str(e)}")
+                        if attempt < max_retries - 1:
+                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...")
+                            await asyncio.sleep(retry_delay)
+                        else:
+                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Skipping set_author_flair action...")
+                            await error_handler(f"process_flair_assignment: Error updating flair for {post_author_name} in /r/{subreddit.display_name}: {e}", notify_discord=True)
+                    except Exception as e:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error setting user flair on ID: {submission_id} in /r/{subreddit.display_name}: {e}")
+                    break
+
+
+
+            if not is_action_completed(submission_id, 'usernote') and 'usernote' in flair_details and flair_details['usernote']['enabled']:
+                usernote_note = flair_details['usernote'].get('note', '')
+
+                if usernote_note.strip():
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: usernote triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
+                    author = post_author_name
+                    note_text = flair_details['usernote']['note']
+                    for placeholder, value in placeholders.items():
+                        note_text = note_text.replace(f"{{{{{placeholder}}}}}", str(value))
+                    link = post.permalink
+                    usernote_type_name = config[0]['GeneralConfiguration'].get('usernote_type_name', None)
+                    for attempt in range(max_retries):
+                        try:
+                            await update_usernotes(subreddit, author, note_text, link, mod_name, usernote_type_name)
+                            mark_action_as_completed(submission_id, 'usernote')
+                        except Exception as e:
+                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error adding usernote on ID: {submission_id} in /r/{subreddit.display_name}: {e}")
+                        break
+                else:
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Skipping usernote action due to empty usernote note on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
+
+            if not is_action_completed(submission_id, 'contributor') and 'contributor' in flair_details and flair_details['contributor']['enabled'] and flair_details['contributor']['action'] == 'add':
+                for attempt in range(max_retries):
+                    try:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: add_contributor triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
+                        await subreddit.contributor.add(post.author)
+                        mark_action_as_completed(submission_id, 'contributor')
+                    except asyncprawcore.exceptions.NotFound:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: User not found for adding as contributor on ID: {submission_id} in /r/{subreddit.display_name}")
+                    except asyncprawcore.exceptions.RequestException as e:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment usernote: Error connecting to Reddit API: {str(e)}") if debugmode else None
                         if attempt < max_retries - 1:
                             print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
                             await asyncio.sleep(retry_delay)
                         else:
                             print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Skipping approve action...") if debugmode else None
                             await error_handler(f"process_flair_assignment: Error Approving Post ID: {submission_id} in /r/{subreddit.display_name}: {e}", notify_discord=True)
+                    except Exception as e:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error adding user as contributor on ID: {submission_id} in /r/{subreddit.display_name}: {e}")
                     break
 
-            if 'remove' in flair_details and flair_details['remove']:
+            if not is_action_completed(submission_id, 'contributor') and 'contributor' in flair_details and flair_details['contributor']['enabled'] and flair_details['contributor']['action'] == 'remove':
                 for attempt in range(max_retries):
                     try:
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: remove triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
-                        mod_note = flair_details['usernote']['note'][:100] if 'usernote' in flair_details and flair_details['usernote']['enabled'] else ''
-
-                        if flair_details.get('modlogReason'):
-                            mod_note = flair_details['modlogReason'][:100]  # Truncate to 100 characters
-
-                        await post.mod.remove(spam=False, mod_note=mod_note)
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: remove_contributor triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
+                        await subreddit.contributor.remove(post.author)
+                        mark_action_as_completed(submission_id, 'contributor')
+                    except asyncprawcore.exceptions.NotFound:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: User not found for removing as contributor on ID: {submission_id} in /r/{subreddit.display_name}")
                     except asyncprawcore.exceptions.RequestException as e:
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment remove: Error connecting to Reddit API: {str(e)}") if debugmode else None
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment contributor: Error connecting to Reddit API: {str(e)}") if debugmode else None
                         if attempt < max_retries - 1:
                             print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
                             await asyncio.sleep(retry_delay)
                         else:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Skipping remove action...") if debugmode else None
-                            await error_handler(f"process_flair_assignment: Error Removing Post ID: {submission_id} in /r/{subreddit.display_name}: {e}", notify_discord=True)
+                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Skipping approve action...") if debugmode else None
+                            await error_handler(f"process_flair_assignment: Error Adding Contributor in /r/{subreddit.display_name}: {e}", notify_discord=True)
+                    except Exception as e:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error removing user as contributor on ID: {submission_id} in /r/{subreddit.display_name}: {e}")
                     break
 
-            if not flair_details.get('remove') and flair_details.get('modlogReason'):
-                for attempt in range(max_retries):
-                    try:
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: modlogReason triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
-                        await post.mod.create_note(note=flair_details['modlogReason'][:250])  # Truncate to 250 characters
-                    except asyncprawcore.exceptions.RequestException as e:
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment remove_modlogreason: Error connecting to Reddit API: {str(e)}") if debugmode else None
-                        if attempt < max_retries - 1:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
-                            await asyncio.sleep(retry_delay)
-                        else:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Skipping create_note action...") if debugmode else None
-                            await error_handler(f"process_flair_assignment: Error Creating Mod Note for ID: {submission_id} in /r/{subreddit.display_name}: {e}", notify_discord=True)
-                    break
 
-            if 'comment' in flair_details and flair_details['comment']['enabled']:
-                post_age_days = (datetime.utcnow() - datetime.utcfromtimestamp(post.created_utc)).days
-                max_age = config[0]['GeneralConfiguration'].get('maxAgeForComment', 175)
-                if post_age_days <= max_age:
-                    comment_body = flair_details['comment'].get('body', '')
-                    if comment_body.strip():
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: comment triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
-                        for attempt in range(max_retries):
-                            try:
-                                if flair_details['remove']:
-                                    # If both 'remove' and 'comment' are configured for the flair GUID
-                                    removal_type = config[0]['GeneralConfiguration'].get('removal_comment_type', '')
-                                    if removal_type == '':
-                                        removal_type = 'public_as_subreddit'  # Default to 'public' if removal_comment_type is blank or unset
-                                    elif removal_type not in ['public', 'private', 'private_exposed', 'public_as_subreddit']:
-                                        removal_type = 'public_as_subreddit'  # Use 'public' as the default if an invalid value is provided
-                                    try:
-                                        await post.mod.send_removal_message(message=removal_reason, type=removal_type)
-                                    except asyncpraw.exceptions.RedditAPIException as e:
-                                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error sending removal message for post ID: {submission_id} in /r/{subreddit.display_name}: {e}")
-                                else:
-                                        # If only 'comment' is configured for the flair GUID
-                                        comment = await post.reply(removal_reason)
-                                        if flair_details['comment']['stickyComment']:
-                                            await comment.mod.distinguish(sticky=True)
-                                        if flair_details['comment']['lockComment']:
-                                            await comment.mod.lock()
-                            except asyncprawcore.exceptions.RequestException as e:
-                                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment comment: Error connecting to Reddit API: {str(e)}") if debugmode else None
-                                if attempt < max_retries - 1:
-                                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
-                                    await asyncio.sleep(retry_delay)
-                                else:
-                                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Skipping comment action...") if debugmode else None
-                                    await error_handler(f"process_flair_assignment: Error Commenting on Post ID: {submission_id} in /r/{subreddit.display_name}: {e}", notify_discord=True)
-                                    #return # exit the process_flair_assignment function and proceed to next modlog
-                            break # exit the try loop and proceed
-                    else:
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Skipping comment action due to empty comment body on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
+        if not is_action_completed(submission_id, 'nukeUserComments') and flair_details.get('nukeUserComments', False):
+            for attempt in range(max_retries):
+                try:
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Nuking comments under Post ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
 
-            if 'lock' in flair_details and flair_details['lock']:
-                for attempt in range(max_retries):
-                    try:
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: lock triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
-                        await post.mod.lock()
-                    except asyncprawcore.exceptions.RequestException as e:
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment lock: Error connecting to Reddit API: {str(e)}") if debugmode else None
-                        if attempt < max_retries - 1:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
-                            await asyncio.sleep(retry_delay)
-                        else:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Skipping lock action...") if debugmode else None
-                            await error_handler(f"process_flair_assignment: Error Locking Post ID: {submission_id} in /r/{subreddit.display_name}: {e}", notify_discord=True)
-                    break
+                    # Fetch the comments of the submission
+                    submission_comments = post.comments
 
-            if 'spoiler' in flair_details and flair_details['spoiler']:
-                for attempt in range(max_retries):
-                    try:
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: spoiler triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
-                        await post.mod.spoiler()
-                    except asyncprawcore.exceptions.RequestException as e:
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment spoiler: Error connecting to Reddit API: {str(e)}") if debugmode else None
-                        if attempt < max_retries - 1:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
-                            await asyncio.sleep(retry_delay)
-                        else:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Skipping spoiler action...") if debugmode else None
-                            await error_handler(f"process_flair_assignment: Error Spoilering Post ID: {submission_id} in /r/{subreddit.display_name}: {e}", notify_discord=True)
-                    break
+                    # Nuke the comments
+                    async for comment in submission_comments:
+                        if not comment.removed and comment.distinguished != 'moderator':  # Check if the comment is not removed and not a moderator comment
+                            for attempt in range(max_retries):
+                                try:
+                                    await comment.mod.remove()
+                                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Removed comment {comment.id} under Post ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
+                                except asyncprawcore.exceptions.RequestException as e:
+                                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment nukeUserComments: Error removing comment {str(e)}") if debugmode else None
+                                    if attempt < max_retries - 1:
+                                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
+                                        await asyncio.sleep(retry_delay)
+                                    else:
+                                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Skipping approve action...") if debugmode else None
+                                        await error_handler(f"process_flair_assignment: Error Approving Post ID: {submission_id} in /r/{subreddit.display_name}: {e}", notify_discord=True)
+                                break
+                    mark_action_as_completed(submission_id, 'nukeUserComments')
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Finished nuking comments under Post ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
 
-            if 'clearPostFlair' in flair_details and flair_details['clearPostFlair']:
-                for attempt in range(max_retries):
-                    try:
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: remove_link_flair triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
-                        await post.mod.flair(text='', css_class='')
-                    except asyncprawcore.exceptions.RequestException as e:
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment clearPostFlair: Error connecting to Reddit API: {str(e)}") if debugmode else None
-                        if attempt < max_retries - 1:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
-                            await asyncio.sleep(retry_delay)
-                        else:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Skipping remove link flair action...") if debugmode else None
-                            await error_handler(f"process_flair_assignment: Error Removing Link Flair on Post ID: {submission_id} in /r/{subreddit.display_name}: {e}", notify_discord=True)
-                    break
-
-            if 'sendToWebhook' in flair_details and flair_details['sendToWebhook']:
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: send_to_webhook triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
-                # Send webhook notification
-                send_webhook_notification(config, post, flair_text, log_entry.mod.name, flair_guid)
-
-
-            # Only process the below if not suspended or deleted
-            if not is_author_deleted_or_suspended:
-
-                # Check if banning is configured for the flair GUID
-                if 'ban' in flair_details and flair_details['ban']['enabled']:
-                    ban_duration = flair_details['ban'].get('duration', '')
-                    ban_message = flair_details['ban']['message']
-                    ban_reason = flair_details['ban']['modNote']
-
-                    if ban_message:
-                        for placeholder, value in placeholders.items():
-                            ban_message = ban_message.replace(f"{{{{{placeholder}}}}}", str(value))
-
-                    if ban_reason:
-                        for placeholder, value in placeholders.items():
-                            ban_reason = ban_reason.replace(f"{{{{{placeholder}}}}}", str(value))[:100]
-
-                    for attempt in range(max_retries):
-                        try:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Debugging: ban_duration={ban_duration}, ban_message={ban_message}, ban_reason={ban_reason}") if debugmode else None
-                            if ban_duration == '' or ban_duration is True:
-                                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: permanent ban triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
-                                await subreddit.banned.add(post.author, ban_message=ban_message, ban_reason=ban_reason)
-                            elif isinstance(ban_duration, int) and ban_duration > 0:
-                                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Temporary ban triggered on ID: {submission_id} for {ban_duration} days in /r/{subreddit.display_name}") if debugmode else None
-                                await subreddit.banned.add(post.author, ban_message=ban_message, ban_reason=ban_reason, duration=ban_duration)
-                            else:
-                                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Skipping ban action due to invalid ban duration on ID: {submission_id} for flair GUID: {flair_details['templateId']} in /r/{subreddit.display_name}") if debugmode else None
-                        except asyncprawcore.exceptions.NotFound:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: User not found for banning on ID: {submission_id} in /r/{subreddit.display_name}")
-                        except asyncprawcore.exceptions.RequestException as e:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment ban: Error connecting to Reddit API: {str(e)}") if debugmode else None
-                            if attempt < max_retries - 1:
-                                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
-                                await asyncio.sleep(retry_delay)
-                            else:
-                                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Skipping ban action...") if debugmode else None
-                                await error_handler(f"process_flair_assignment: Error Banning User under Post ID: {submission_id} in /r/{subreddit.display_name}: {e}", notify_discord=True)
-                        except Exception as e:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error banning user on ID: {submission_id} in /r/{subreddit.display_name}: {e}")
-                        break
-
-                if 'unban' in flair_details and flair_details['unban']:
-                    for attempt in range(max_retries):
-                        try:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: unban triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
-                            await subreddit.banned.remove(post.author)
-                        except asyncprawcore.exceptions.NotFound:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: User not found for unbanning on ID: {submission_id} in /r/{subreddit.display_name}")
-                        except asyncprawcore.exceptions.RequestException as e:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment unban: Error connecting to Reddit API: {str(e)}") if debugmode else None
-                            if attempt < max_retries - 1:
-                                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
-                                await asyncio.sleep(retry_delay)
-                            else:
-                                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Skipping approve action...") if debugmode else None
-                                await error_handler(f"process_flair_assignment: Error Unbanning user {post_author_name} in /r/{subreddit.display_name}: {e}", notify_discord=True)
-                        except Exception as e:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error unbanning user on ID: {submission_id} in /r/{subreddit.display_name}: {e}")
-                        break
-
-
-                if 'userFlair' in flair_details and flair_details['userFlair']['enabled']:
-                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: set_author_flair triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
-
-                    debug_current_Flair = f"{post_author_name} Current flair: text='{flair_text}', css_class='{flair_css_class}' |"
-                    # Update the flair text based on the configuration
-                    if flair_details['userFlair']['text']:
-                        flair_text = flair_details['userFlair']['text']
-                        for placeholder, value in placeholders.items():
-                            flair_text = flair_text.replace(f"{{{{{placeholder}}}}}", str(value))
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Updating flair text to: '{flair_text}'") if verbosemode else None
-
-                    # Update the flair CSS class based on the configuration
-                    if flair_details['userFlair']['cssClass']:
-                        flair_css_class = flair_details['userFlair']['cssClass']
-                        for placeholder, value in placeholders.items():
-                            flair_css_class = flair_css_class.replace(f"{{{{{placeholder}}}}}", str(value))
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Updating flair CSS class to: '{flair_css_class}'") if verbosemode else None
-
-                    # Set the updated flair for the user
-                    for attempt in range(max_retries):
-                        try:
-                            await subreddit.flair.set(post.author.name, text=flair_text, css_class=flair_css_class)
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: {debug_current_Flair} Updated to text='{flair_text}', css_class='{flair_css_class}'") if debugmode else None
-                        except asyncprawcore.exceptions.NotFound:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: User not found for setting user flair on ID: {submission_id} in /r/{subreddit.display_name}")
-                        except asyncprawcore.exceptions.RequestException as e:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment userFlair: Error connecting to Reddit API: {str(e)}")
-                            if attempt < max_retries - 1:
-                                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...")
-                                await asyncio.sleep(retry_delay)
-                            else:
-                                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Skipping set_author_flair action...")
-                                await error_handler(f"process_flair_assignment: Error updating flair for {post_author_name} in /r/{subreddit.display_name}: {e}", notify_discord=True)
-                        except Exception as e:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error setting user flair on ID: {submission_id} in /r/{subreddit.display_name}: {e}")
-                        break
-
-
-
-                if 'usernote' in flair_details and flair_details['usernote']['enabled']:
-                    usernote_note = flair_details['usernote'].get('note', '')
-
-                    if usernote_note.strip():
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: usernote triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
-                        author = post_author_name
-                        note_text = flair_details['usernote']['note']
-                        for placeholder, value in placeholders.items():
-                            note_text = note_text.replace(f"{{{{{placeholder}}}}}", str(value))
-                        link = post.permalink
-                        mod_name = log_entry.mod.name
-                        usernote_type_name = config[0]['GeneralConfiguration'].get('usernote_type_name', None)
-                        for attempt in range(max_retries):
-                            try:
-                                await update_usernotes(subreddit, author, note_text, link, mod_name, usernote_type_name)
-                            except Exception as e:
-                                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error adding usernote on ID: {submission_id} in /r/{subreddit.display_name}: {e}")
-                            break
-                    else:
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Skipping usernote action due to empty usernote note on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
-
-                if 'contributor' in flair_details and flair_details['contributor']['enabled'] and flair_details['contributor']['action'] == 'add':
-                    for attempt in range(max_retries):
-                        try:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: add_contributor triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
-                            await subreddit.contributor.add(post.author)
-                        except asyncprawcore.exceptions.NotFound:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: User not found for adding as contributor on ID: {submission_id} in /r/{subreddit.display_name}")
-                        except asyncprawcore.exceptions.RequestException as e:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment usernote: Error connecting to Reddit API: {str(e)}") if debugmode else None
-                            if attempt < max_retries - 1:
-                                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
-                                await asyncio.sleep(retry_delay)
-                            else:
-                                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Skipping approve action...") if debugmode else None
-                                await error_handler(f"process_flair_assignment: Error Approving Post ID: {submission_id} in /r/{subreddit.display_name}: {e}", notify_discord=True)
-                        except Exception as e:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error adding user as contributor on ID: {submission_id} in /r/{subreddit.display_name}: {e}")
-                        break
-
-                if 'contributor' in flair_details and flair_details['contributor']['enabled'] and flair_details['contributor']['action'] == 'remove':
-                    for attempt in range(max_retries):
-                        try:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: remove_contributor triggered on ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
-                            await subreddit.contributor.remove(post.author)
-                        except asyncprawcore.exceptions.NotFound:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: User not found for removing as contributor on ID: {submission_id} in /r/{subreddit.display_name}")
-                        except asyncprawcore.exceptions.RequestException as e:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment contributor: Error connecting to Reddit API: {str(e)}") if debugmode else None
-                            if attempt < max_retries - 1:
-                                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
-                                await asyncio.sleep(retry_delay)
-                            else:
-                                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Skipping approve action...") if debugmode else None
-                                await error_handler(f"process_flair_assignment: Error Adding Contributor in /r/{subreddit.display_name}: {e}", notify_discord=True)
-                        except Exception as e:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error removing user as contributor on ID: {submission_id} in /r/{subreddit.display_name}: {e}")
-                        break
-
-
-            if flair_details.get('nukeUserComments', False):
-                for attempt in range(max_retries):
-                    try:
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Nuking comments under Post ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
-
-                        # Fetch the comments of the submission
-                        submission_comments = post.comments
-
-                        # Nuke the comments
-                        async for comment in submission_comments:
-                            if not comment.removed and comment.distinguished != 'moderator':  # Check if the comment is not removed and not a moderator comment
-                                for attempt in range(max_retries):
-                                    try:
-                                        await comment.mod.remove()
-                                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Removed comment {comment.id} under Post ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
-                                    except asyncprawcore.exceptions.RequestException as e:
-                                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment nukeUserComments: Error removing comment {str(e)}") if debugmode else None
-                                        if attempt < max_retries - 1:
-                                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retrying in {retry_delay} seconds...") if debugmode else None
-                                            await asyncio.sleep(retry_delay)
-                                        else:
-                                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Max retries exceeded. Skipping approve action...") if debugmode else None
-                                            await error_handler(f"process_flair_assignment: Error Approving Post ID: {submission_id} in /r/{subreddit.display_name}: {e}", notify_discord=True)
-                                    break
-
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Finished nuking comments under Post ID: {submission_id} in /r/{subreddit.display_name}") if debugmode else None
-
-                    except asyncprawcore.exceptions.RequestException as e:
-                        error_message = f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment nukeUserComments: Error fetching comments for post ID: {submission_id} in /r/{subreddit.display_name}: {str(e)}"
-                        print(error_message) if debugmode else None
-                        await error_handler(error_message, notify_discord=True)
-                        # Handle the error, e.g., retry or log the error
-                    break
+                except asyncprawcore.exceptions.RequestException as e:
+                    error_message = f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: process_flair_assignment nukeUserComments: Error fetching comments for post ID: {submission_id} in /r/{subreddit.display_name}: {str(e)}"
+                    print(error_message) if debugmode else None
+                    await error_handler(error_message, notify_discord=True)
+                    # Handle the error, e.g., retry or log the error
+                break
 
 
 
@@ -1341,15 +1413,6 @@ async def monitor_mod_log(reddit, bot_username, max_concurrency=2):
 
     await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair Helper 2 has started up successfully!\nBot username: **{bot_username}**\n\n{bot_username} moderates subreddits:\n   {formatted_subreddits}")
 
-    semaphore = asyncio.Semaphore(max_concurrency)
-
-    async def process_flair_edit(log_entry):
-        async with semaphore:
-            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair action detected by {log_entry.mod} in /r/{log_entry.subreddit}") if debugmode else None
-            subreddit_instance = await reddit.subreddit(log_entry.subreddit)
-            config = get_cached_config(log_entry.subreddit)
-            await process_flair_assignment(reddit, log_entry, config, subreddit_instance)
-
     while True:
         subreddit = await reddit.subreddit("mod")
         async for log_entry in subreddit.mod.stream.log(skip_existing=True):
@@ -1370,11 +1433,94 @@ async def monitor_mod_log(reddit, bot_username, max_concurrency=2):
                 and log_entry.target_fullname is not None
                 and log_entry.target_fullname.startswith('t3_')):
                 # This is a link (submission) flair edit
-                loop = asyncio.get_running_loop()
-                loop.create_task(process_flair_edit(log_entry))
+                submission_id = log_entry.target_fullname[3:]  # Remove the 't3_' prefix
+                config = get_cached_config(log_entry.subreddit)
+
+                if config is not None:
+
+                    post = await reddit.submission(submission_id)
+                    flair_guid = getattr(post, 'link_flair_template_id', None)  # Use getattr to safely retrieve the attribute
+
+                    flair_details = next((flair for flair in config[1:] if flair['templateId'] == flair_guid), None)
+
+                    if flair_details is not None:
+                        actions = []
+
+                        if flair_details.get('approve', False):
+                            actions.append('approve')
+                        if flair_details.get('remove', False):
+                            actions.append('remove')
+                        if flair_details.get('lock', False):
+                            actions.append('lock')
+                        if flair_details.get('spoiler', False):
+                            actions.append('spoiler')
+                        if flair_details.get('clearPostFlair', False):
+                            actions.append('clearPostFlair')
+                        if flair_details.get('modlogReason', '').strip():
+                            actions.append('modlogReason')
+                        if flair_details.get('comment', {}).get('enabled', False):
+                            actions.append('comment')
+                        if flair_details.get('nukeUserComments', False):
+                            actions.append('nukeUserComments')
+                        if flair_details.get('usernote', {}).get('enabled', False):
+                            actions.append('usernote')
+                        if flair_details.get('contributor', {}).get('enabled', False):
+                            actions.append('contributor')
+                        if flair_details.get('userFlair', {}).get('enabled', False):
+                            actions.append('userFlair')
+                        if flair_details.get('ban', {}).get('enabled', False):
+                            actions.append('ban')
+                        if flair_details.get('unban', False):
+                            actions.append('unban')
+                        if flair_details.get('sendToWebhook', False):
+                            actions.append('sendToWebhook')
+
+                        if actions:
+                            insert_actions_to_database(submission_id, actions, log_entry.mod.name)
+                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Actions for flair GUID {flair_guid} under submission {submission_id} added to the database") if debugmode else None
+                        else:
+                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: No actions found for flair GUID {flair_guid}") if debugmode else None
+                    else:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair GUID {flair_guid} not found in the configuration") if debugmode else None
+                else:
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Configuration not found for /r/{log_entry.subreddit}") if debugmode else None
 
             else:
                 print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Ignoring action: {log_entry.action} in /r/{log_entry.subreddit}") if verbosemode else None
+
+
+async def process_flair_actions(reddit, max_concurrency=2):
+    semaphore = asyncio.Semaphore(max_concurrency)
+
+    async def process_flair_assignment_with_semaphore(submission_id, mod_name):
+        async with semaphore:
+            try:
+                post = await reddit.submission(submission_id)
+                subreddit = post.subreddit
+                config = get_cached_config(subreddit.display_name)
+
+                await process_flair_assignment(reddit, post, config, subreddit, mod_name)
+
+                if is_submission_completed(submission_id):
+                    delete_completed_actions(submission_id)
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: All actions for submission {submission_id} completed and deleted from the database") if debugmode else None
+
+            except Exception as e:
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error processing actions for submission {submission_id}: {str(e)}") if debugmode else None
+                # Handle the error appropriately (e.g., log, retry, or skip)
+
+    while True:
+        pending_submission_ids = get_pending_submission_ids_from_database()
+
+        tasks = []
+        for submission_id, mod_name in pending_submission_ids:
+            task = asyncio.create_task(process_flair_assignment_with_semaphore(submission_id, mod_name))
+            tasks.append(task)
+
+        await asyncio.gather(*tasks)
+
+        await asyncio.sleep(1)  # Adjust the delay as needed
+
 
 
 @reddit_error_handler
@@ -1397,7 +1543,7 @@ last_startup_time_main = None
 
 @reddit_error_handler
 async def main():
-    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair Helper 2 entered main()") if debugmode else None
+    create_actions_database()
 
     global last_startup_time_main
 
@@ -1420,10 +1566,10 @@ async def main():
     print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair Helper 2 fetching bot_username") if debugmode else None
     me = await reddit.user.me()
     bot_username = me.name
-    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair Helper 2 fetched Bot username: {bot_username}") if debugmode else None
+    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair Helper 2 fetched bot username: {bot_username}") if debugmode else None
 
     # Check if the database is empty
-    if is_database_empty():
+    if is_config_database_empty():
         print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Database is empty. Fetching and caching configurations for all moderated subreddits.") if verbosemode else None
         await fetch_and_cache_configs(reddit, bot_username)
     else:
@@ -1431,11 +1577,12 @@ async def main():
 
     # Create separate tasks for each coroutine
     bot_task = asyncio.create_task(monitor_mod_log(reddit, bot_username))
+    flair_actions_task = asyncio.create_task(process_flair_actions(reddit))
     pm_task = asyncio.create_task(monitor_private_messages(reddit))
     wiki_cache_task = asyncio.create_task(delayed_fetch_and_cache_configs(reddit, bot_username, wiki_fetch_delay))
     mod_invites_task = asyncio.create_task(check_new_mod_invitations(reddit, bot_username))
 
-    await asyncio.gather(bot_task, pm_task, wiki_cache_task, mod_invites_task)
+    await asyncio.gather(bot_task, flair_actions_task, pm_task, wiki_cache_task, mod_invites_task)
 
 
 if __name__ == "__main__":
