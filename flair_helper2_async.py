@@ -47,13 +47,6 @@ database_lock = asyncio.Lock()
 if colored_console_output:
     from termcolor import colored, cprint  # https://pypi.org/project/termcolor/
 
-try:
-    # Enable ModQueue Processing (Remove Ban Evasion Items from [deleted] accounts)
-    import modqueue_processing
-    modqueue_processing_enabled = True
-except ImportError:
-    modqueue_processing_enabled = False
-
 
 async def error_handler(error_message, notify_discord=False):
     print(error_message) if debugmode else None
@@ -824,11 +817,10 @@ async def process_flair_assignment(reddit, post, config, subreddit, mod_name, ma
             formatted_footer = formatted_footer.replace(f"{{{{{placeholder}}}}}", str(value))
 
         # Replace placeholders in specific flair_details values
-        formatted_flair_details = flair_details['notes']
+        formatted_flair_removal_details = flair_details['comment'].get('body', '')
         for placeholder, value in placeholders.items():
-            formatted_flair_details = formatted_flair_details.replace(f"{{{{{placeholder}}}}}", str(value))
-
-        removal_reason = f"{formatted_header}\n\n{formatted_flair_details}\n\n{formatted_footer}"
+            formatted_flair_removal_details = formatted_flair_removal_details.replace(f"{{{{{placeholder}}}}}", str(value))
+        formatted_removal_reason_comment = f"{formatted_header}\n\n{formatted_flair_removal_details}\n\n{formatted_footer}"
 
         # Execute the configured actions
         if not is_action_completed(submission_id, 'approve') and 'approve' in flair_details and flair_details['approve']:
@@ -857,38 +849,6 @@ async def process_flair_assignment(reddit, post, config, subreddit, mod_name, ma
             await post.mod.create_note(note=flair_details['modlogReason'][:250])  # Truncate to 250 characters
             mark_action_as_completed(submission_id, 'modlogReason')
 
-        if not is_action_completed(submission_id, 'comment') and 'comment' in flair_details and flair_details['comment']['enabled']:
-            post_age_days = (datetime.utcnow() - datetime.utcfromtimestamp(post.created_utc)).days
-            max_age = config[0]['GeneralConfiguration'].get('maxAgeForComment', 175)
-            if post_age_days <= max_age:
-                comment_body = flair_details['comment'].get('body', '')
-                if comment_body.strip():
-                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - comment triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
-                    if flair_details['remove']:
-                        # If both 'remove' and 'comment' are configured for the flair GUID
-                        removal_type = config[0]['GeneralConfiguration'].get('removal_comment_type', '')
-                        if removal_type == '':
-                            removal_type = 'public_as_subreddit'  # Default to 'public' if removal_comment_type is blank or unset
-                        elif removal_type not in ['public', 'private', 'private_exposed', 'public_as_subreddit']:
-                            removal_type = 'public_as_subreddit'  # Use 'public' as the default if an invalid value is provided
-                        await post.mod.send_removal_message(message=removal_reason, type=removal_type)
-                    else:
-                        # If only 'comment' is configured for the flair GUID
-                        comment_body = flair_details['comment']['body']
-                        for placeholder, value in placeholders.items():
-                            comment_body = comment_body.replace(f"{{{{{placeholder}}}}}", str(value))
-                        comment = await post.reply(comment_body)
-                        if flair_details['comment']['stickyComment']:
-                            await comment.mod.distinguish(sticky=True)
-                        if flair_details['comment']['lockComment']:
-                            await comment.mod.lock()
-                    mark_action_as_completed(submission_id, 'comment')
-                else:
-                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Skipping comment action due to empty comment body on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
-            else:
-                # Submission over age, mark as completed.
-                mark_action_as_completed(submission_id, 'comment')
-
         if not is_action_completed(submission_id, 'lock') and 'lock' in flair_details and flair_details['lock']:
             print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - lock triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
             await post.mod.lock()
@@ -913,6 +873,35 @@ async def process_flair_assignment(reddit, post, config, subreddit, mod_name, ma
 
         # Only process the below if not suspended or deleted
         if not is_author_deleted_or_suspended:
+
+            if not is_action_completed(submission_id, 'comment') and 'comment' in flair_details and flair_details['comment']['enabled']:
+                post_age_days = (datetime.utcnow() - datetime.utcfromtimestamp(post.created_utc)).days
+                max_age = config[0]['GeneralConfiguration'].get('maxAgeForComment', 175)
+                if post_age_days <= max_age:
+                    comment_body = flair_details['comment'].get('body', '')
+                    if comment_body.strip():
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - comment triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+                        if flair_details['remove']:
+                            # If both 'remove' and 'comment' are configured for the flair GUID
+                            removal_type = config[0]['GeneralConfiguration'].get('removal_comment_type', '')
+                            if removal_type == '':
+                                removal_type = 'public_as_subreddit'  # Default to 'public' if removal_comment_type is blank or unset
+                            elif removal_type not in ['public', 'private', 'private_exposed', 'public_as_subreddit']:
+                                removal_type = 'public_as_subreddit'  # Use 'public' as the default if an invalid value is provided
+                            await post.mod.send_removal_message(message=formatted_removal_reason_comment, type=removal_type)
+                        else:
+                            # If only 'comment' is configured for the flair GUID
+                            comment = await post.reply(formatted_removal_reason_comment)
+                            if flair_details['comment']['stickyComment']:
+                                await comment.mod.distinguish(sticky=True)
+                            if flair_details['comment']['lockComment']:
+                                await comment.mod.lock()
+                        mark_action_as_completed(submission_id, 'comment')
+                    else:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Skipping comment action due to empty comment body on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+                else:
+                    # Submission over age, mark as completed.
+                    mark_action_as_completed(submission_id, 'comment')
 
             # Check if banning is configured for the flair GUID
             if not is_action_completed(submission_id, 'ban') and 'ban' in flair_details and flair_details['ban']['enabled']:
@@ -997,6 +986,7 @@ async def process_flair_assignment(reddit, post, config, subreddit, mod_name, ma
 
         else:
             #User Suspended or Deleted, Mark actions as complete
+            mark_action_as_completed(submission_id, 'comment')
             mark_action_as_completed(submission_id, 'ban')
             mark_action_as_completed(submission_id, 'unban')
             mark_action_as_completed(submission_id, 'userFlair')
@@ -1027,6 +1017,19 @@ async def process_flair_assignment(reddit, post, config, subreddit, mod_name, ma
 async def handle_private_messages(reddit):
     async for message in reddit.inbox.unread(limit=None):
         if isinstance(message, asyncpraw.models.Message):
+
+            if message.body.startswith('gadzooks!'):
+                if auto_accept_mod_invites:
+                    subreddit = await reddit.subreddit(message.subreddit.display_name)
+                    try:
+                        await subreddit.mod.accept_invite()
+                        print(f"Accepted mod invite for /r/{subreddit.display_name}")
+                    except asyncprawcore.NotFound:
+                        print(f"Invalid mod invite for /r/{subreddit.display_name}")
+                    except Exception as e:
+                        print(f"Failed to accept mod invite for /r/{subreddit.display_name}: {str(e)}")
+                    await message.mark_read()
+
 
             if message.author == "reddit":
                 # Ignore messages from the "reddit" user (admins or system messages)
@@ -1202,44 +1205,6 @@ async def create_auto_flairhelper_wiki(reddit, subreddit, mode):
 
     print(f"\n\nFormatted JSON Output Message:\n\n{json_output}\n\n") if verbosemode else None
     return final_output
-
-
-@reddit_error_handler
-async def check_new_mod_invitations(reddit, bot_username):
-    while True:
-        current_subreddits = [sub async for sub in reddit.user.moderator_subreddits()]
-        stored_subreddits = get_stored_subreddits()
-
-        new_subreddits = [sub for sub in current_subreddits if sub.display_name not in stored_subreddits]
-
-        for subreddit in new_subreddits:
-            if f"u_{bot_username}" in subreddit.display_name:
-                #print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: check_new_mod_invitations: Skipping bot's own user page: /r/{subreddit.display_name}") if debugmode else None
-                continue  # Skip the bot's own user page
-
-            subreddit_instance = await get_subreddit(reddit, subreddit.display_name)
-
-
-            wiki_page = await subreddit.wiki.get_page('flair_helper')
-            wiki_content = wiki_page.content_md.strip()
-
-            if not wiki_content:
-                # Flair Helper wiki page exists but is blank
-                auto_gen_config = await create_auto_flairhelper_wiki(reddit, subreddit, mode="wiki")
-                await subreddit.wiki.create('flair_helper', auto_gen_config)
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Created auto_gen_config for 'flair_helper' wiki page for /r/{subreddit.display_name}") if debugmode else None
-
-                subject = f"Flair Helper Configuration Needed for /r/{subreddit.display_name}"
-                message = f"Hi! I noticed that I was recently added as a moderator to /r/{subreddit.display_name}.\n\nThe Flair Helper wiki page here: /r/{subreddit.display_name}/wiki/flair_helper exists but was currently blank.  I've went ahead and generated a working config based upon your 'Mod Only' flairs you have configured.  Otherwise, you can send me a PM with 'list' or 'auto' to generate a sample configuration.\n\n[Generate a List of Flairs](https://www.reddit.com/message/compose?to=/u/{bot_username}&subject=list&message={subreddit.display_name})\n\n[Auto-Generate a sample Flair Helper Config](https://www.reddit.com/message/compose?to=/u/{bot_username}&subject=auto&message={subreddit.display_name})\n\nYou can find more information in the Flair Helper documentation on /r/Flair_Helper2/wiki/tutorial/ \n\nHappy Flairing!"
-                await subreddit_instance.message(subject, message)
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Sent PM to /r/{subreddit.display_name} moderators to create a Flair Helper configuration (wiki page exists but is blank)") if debugmode else None
-            else:
-                # Flair Helper wiki page exists and has content
-                await fetch_and_cache_configs(reddit, bot_username, max_retries=3, retry_delay=5, single_sub=subreddit.display_name)
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Fetched and cached configuration for /r/{subreddit.display_name}") if debugmode else None
-            break
-
-        await asyncio.sleep(3600)  # Check for new mod invitations every hour (adjust as needed)
 
 
 last_startup_time_MonitorModLog = None
@@ -1473,13 +1438,13 @@ async def bot_main():
     bot_username = me.name
     print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair Helper 2 fetched bot username: {bot_username}") if debugmode else None
 
+
     # Create separate tasks for each coroutine
     bot_task = asyncio.create_task(monitor_mod_log(reddit, bot_username))
     flair_actions_task = asyncio.create_task(process_flair_actions(reddit, max_concurrency=2))
     pm_task = asyncio.create_task(monitor_private_messages(reddit))
-    mod_invites_task = asyncio.create_task(check_new_mod_invitations(reddit, bot_username))
 
-    tasks_to_gather = [bot_task, flair_actions_task, pm_task, mod_invites_task]
+    tasks_to_gather = [bot_task, flair_actions_task, pm_task]
 
     # Check if the database is empty
     if is_config_database_empty():
@@ -1488,17 +1453,7 @@ async def bot_main():
     else:
         print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Database contains subreddit configurations. Proceeding with the delayed fetch and cache.") if verbosemode else None
         wiki_cache_task = asyncio.create_task(delayed_fetch_and_cache_configs(reddit, bot_username, wiki_fetch_delay))
-        tasks_to_gather.append(wiki_cache_task)   
-
-
-    if modqueue_processing_enabled:
-        try:
-            from modqueue_processing import monitor_mod_queue
-            modqueue_task = asyncio.create_task(monitor_mod_queue(reddit, bot_username))
-            tasks_to_gather.append(modqueue_task)
-        except ImportError as e:
-            await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error importing monitor_mod_queue: {str(e)}")
-            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error importing monitor_mod_queue: {str(e)}")
+        tasks_to_gather.append(wiki_cache_task)
 
 
     await asyncio.gather(*tasks_to_gather)
