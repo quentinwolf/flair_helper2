@@ -211,15 +211,16 @@ def create_actions_database():
                  (submission_id TEXT,
                   action TEXT,
                   completed INTEGER,
-                  mod_name TEXT)''')
+                  mod_name TEXT,
+                  flair_guid TEXT)''')
     conn.commit()
     conn.close()
 
-def insert_actions_to_database(submission_id, actions, mod_name):
+def insert_actions_to_database(submission_id, actions, mod_name, flair_guid):
     conn = sqlite3.connect('flair_helper_actions.db')
     c = conn.cursor()
     for action in actions:
-        c.execute("INSERT INTO actions VALUES (?, ?, ?, ?)", (submission_id, action, 0, mod_name))
+        c.execute("INSERT INTO actions VALUES (?, ?, ?, ?, ?)", (submission_id, action, 0, mod_name, flair_guid))
     conn.commit()
     conn.close()
 
@@ -1209,6 +1210,8 @@ async def create_auto_flairhelper_wiki(reddit, subreddit, mode):
 
 last_startup_time_MonitorModLog = None
 
+last_flair_data_dict = {}
+
 # Primary Mod Log Monitor
 @reddit_error_handler
 async def monitor_mod_log(reddit, bot_username, max_concurrency=2):
@@ -1281,9 +1284,18 @@ async def monitor_mod_log(reddit, bot_username, max_concurrency=2):
                         config = get_cached_config(log_entry.subreddit)
 
                         if config is not None:
-
                             post = await reddit.submission(submission_id)
                             flair_guid = getattr(post, 'link_flair_template_id', None)  # Use getattr to safely retrieve the attribute
+
+                            if flair_guid is not None:
+                                last_flair_data_key = f"{submission_id}_{flair_guid}"
+                                current_time = time.time()
+
+                                if last_flair_data_key in last_flair_data_dict and current_time - last_flair_data_dict[last_flair_data_key] < config[0]['GeneralConfiguration'].get('ignore_same_flair_seconds', 60):
+                                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Ignoring duplicate flair assignment for submission {submission_id} with flair GUID {flair_guid}") if debugmode else None
+                                    continue
+
+                                last_flair_data_dict[last_flair_data_key] = current_time
 
                             if colored_console_output:
                                 disp_flair_guid = colored(flair_guid, "magenta")
@@ -1325,17 +1337,18 @@ async def monitor_mod_log(reddit, bot_username, max_concurrency=2):
                                     actions.append('sendToWebhook')
 
                                 if actions:
-                                    insert_actions_to_database(submission_id, actions, log_entry.mod.name)
+                                    insert_actions_to_database(submission_id, actions, log_entry.mod.name, flair_guid)
                                     print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Actions for flair GUID {disp_flair_guid} under submission {disp_submission_id} added to the database") if debugmode else None
                                 else:
                                     print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: No actions found for flair GUID {disp_flair_guid}") if debugmode else None
                             else:
                                 print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair GUID {disp_flair_guid} not found in the configuration") if debugmode else None
                         else:
-                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Configuration not found for {disp_subreddit_displayname}") if debugmode else None
+                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Configuration not found for /r/{disp_subreddit_displayname}") if debugmode else None
 
                     else:
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Ignoring action: {log_entry.action} in {disp_subreddit_displayname}") if verbosemode else None
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Ignoring action: {log_entry.action} in /r/{disp_subreddit_displayname}") if verbosemode else None
+
 
         except asyncprawcore.exceptions.RequestException as e:
             print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error in mod log stream: {str(e)}. Retrying...") if debugmode else None
