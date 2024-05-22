@@ -26,7 +26,9 @@ verbosemode = False
 colored_console_output = False #If set to True, requires https://pypi.org/project/termcolor
 
 auto_accept_mod_invites = False
-send_pm_on_wiki_config_update = False
+
+# Config Validation Errors are always PM'ed regardless of being True or False
+send_pm_on_wiki_config_update = True
 
 discord_bot_notifications = False
 discord_webhook_url = "YOUR_DISCORD_WEBHOOK_URL"
@@ -382,7 +384,7 @@ async def check_mod_permissions(subreddit, mod_name):
     return None
 
 
-def validate_and_correct_config(config):
+def correct_config(config):
     corrected_config = []
 
     for item in config:
@@ -424,10 +426,12 @@ async def fetch_and_cache_configs(reddit, bot_username, max_retries=3, retry_del
             tasks.append(process_subreddit_config(reddit, subreddit, bot_username, max_retries, retry_delay, max_retry_delay, delay_between_wiki_fetch))
 
     await asyncio.gather(*tasks)
-    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Completed checking all Wiki page configuration.") if debugmode else None
+    if single_sub:
+        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Completed checking Wiki page configuration for {subreddit.display_name}.") if debugmode else None
+    else:
+        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Completed checking all Wiki page configuration.") if debugmode else None
 
 
-@reddit_error_handler
 async def process_subreddit_config(reddit, subreddit, bot_username, max_retries, retry_delay, max_retry_delay, delay_between_wiki_fetch):
     retries = 0
 
@@ -451,42 +455,64 @@ async def process_subreddit_config(reddit, subreddit, bot_username, max_retries,
             print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair Helper configuration for {disp_subreddit_displayname} is blank. Skipping...") if debugmode else None
             break  # Skip processing if the wiki page is blank
 
-        try:
-            # Try parsing the content as JSON
-            updated_config = json.loads(wiki_content)
-        except json.JSONDecodeError:
+
+
+        if wiki_content.strip().startswith('['):
+            # Content starts with '[', assume it's JSON
             try:
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error parsing Flair Helper configuration as JSON for {disp_subreddit_displayname}.  Attempting YAML to JSON conversion...") if debugmode else None
-                # If JSON parsing fails, try parsing as YAML
-                updated_config = yaml.safe_load(wiki_content)
-                # Convert the YAML configuration to JSON format
-                updated_config = convert_yaml_to_json(updated_config)
-            except yaml.YAMLError:
-                # If both JSON and YAML parsing fail, send a notification to the subreddit
+                updated_config = json.loads(wiki_content)
+                print(f"Configuration for {subreddit.display_name} is in JSON format.") if verbosemode else None
+            except json.JSONDecodeError as e:
+                await error_handler(f"Invalid JSON format for {subreddit.display_name}. Error details: {str(e)}", notify_discord=True)
+
+                wiki_revision = await get_latest_wiki_revision(subreddit)
+                mod_name = wiki_revision['author']
+                mod_name_str = str(mod_name)
+
+                # If both JSON and YAML parsing fail, send a notification to the subreddit and the mod who made the edit
                 subject = f"Flair Helper Configuration Error in /r/{subreddit.display_name}"
                 message = (
-                    f"The Flair Helper configuration for /r/{subreddit.display_name} is in an unsupported or invalid format.\n\n"
-                    f"Please check the [flair_helper wiki page](https://www.reddit.com/r/{subreddit.display_name}/wiki/flair_helper) "
-                    f"and ensure that the configuration is in a valid JSON format.\n\n"
-                    f"Flair Helper supports legacy loading of YAML configurations, which will be automatically converted to JSON format. "
-                    f"However, going forward, the JSON format is preferred and will be used for saving and processing the configuration.\n\n"
-                    f"If you need assistance, please refer to the Flair Helper documentation or contact the bot maintainer."
+                    f"The [Flair Helper configuration](https://www.reddit.com/r/{subreddit.display_name}/wiki/edit/flair_helper) for /r/{subreddit.display_name} is in an unsupported or invalid format.\n\n"
+                    f"Please check the [flair_helper wiki page](https://www.reddit.com/r/{subreddit.display_name}/wiki/edit/flair_helper) and ensure that the configuration is in a valid JSON or YAML format.\n\n"
+                    f"-----\n\nError details: {str(e)}\n\n-----\n\n"
+                    f"Flair Helper will continue using the previously cached configuration until the format is fixed.\n\n"
+                    f"You may wish to try running your config through [JSONLint](https://jsonlint.com) for JSON or [YAMLLint](http://www.yamllint.com/) for YAML to validate and find any errors first."
                 )
-                if send_pm_on_wiki_config_update:
-                    await subreddit.message(subject, message)
-                raise ValueError(f"Unsupported or invalid configuration format for {disp_subreddit_displayname}")
+                try:
+                    # Message the Subreddit
+                    #subreddit_instance = await reddit.subreddit(subreddit.display_name)
+                    #await subreddit_instance.message(subject, message)
+
+                    # Message the Moderator who made the change
+                    redditor = await reddit.redditor(mod_name_str)
+                    await redditor.message(subject, message)
+                except Exception as e:
+                    await error_handler(f"Error sending message to {subreddit.display_name} or moderator {mod_name}: {str(e)}", notify_discord=True)
+
+                return
+        else:
+            # Content doesn't start with '[', assume it's YAML
+            try:
+                updated_config = yaml.safe_load(wiki_content)
+                await error_handler(f"Configuration for {subreddit.display_name} is in YAML format. Converting to JSON.", notify_discord=True)
+                updated_config = convert_yaml_to_json(updated_config)
+            except yaml.YAMLError as e:
+                await error_handler(f"Invalid YAML format for {subreddit.display_name}. Error details: {str(e)}", notify_discord=True)
+                return
+
+
 
         # Perform validation and automatic correction
-        updated_config = validate_and_correct_config(updated_config)
+        updated_config = correct_config(updated_config)
 
         cached_config = get_cached_config(subreddit.display_name)
 
         if cached_config is None or cached_config != updated_config:
             # Check if the mod who edited the wiki page has the "config" permission
-            if updated_config[0]['GeneralConfiguration'].get('require_config_to_edit', False):
-                wiki_revision = await get_latest_wiki_revision(subreddit)
-                mod_name = wiki_revision['author']
+            wiki_revision = await get_latest_wiki_revision(subreddit)
+            mod_name = wiki_revision['author']
 
+            if updated_config[0]['GeneralConfiguration'].get('require_config_to_edit', False):
                 if mod_name != bot_username:
                     mod_permissions = await check_mod_permissions(subreddit, mod_name)
                     if mod_permissions is not None and ('all' in mod_permissions or 'config' in mod_permissions):
@@ -500,7 +526,7 @@ async def process_subreddit_config(reddit, subreddit, bot_username, max_retries,
 
             try:
                 await cache_config(subreddit.display_name, updated_config)
-                await error_handler(f"The Flair Helper wiki page configuration for {subreddit.display_name} has been successfully cached and reloaded.", notify_discord=False)
+                await error_handler(f"The [Flair Helper wiki page configuration](https://www.reddit.com/r/{subreddit.display_name}/wiki/edit/flair_helper) for {subreddit.display_name} has been successfully cached and reloaded.", notify_discord=False)
 
                 # Save the validated and corrected configuration back to the wiki page
                 await wiki_page.edit(content=json.dumps(updated_config, indent=4))
@@ -510,7 +536,7 @@ async def process_subreddit_config(reddit, subreddit, bot_username, max_retries,
                         subreddit_instance = await get_subreddit(reddit, subreddit.display_name)
                         await subreddit_instance.message(
                             subject="Flair Helper Configuration Reloaded",
-                            message=f"The Flair Helper configuration for /r/{subreddit.display_name} has been successfully reloaded."
+                            message=f"Changes made by {mod_name} to the [Flair Helper configuration](https://www.reddit.com/r/{subreddit.display_name}/wiki/edit/flair_helper) for /r/{subreddit.display_name} has been successfully reloaded."
                         )
                     except asyncpraw.exceptions.RedditAPIException as e:
                         await error_handler(f"Error sending message to {subreddit.display_name}: {e}", notify_discord=True)
@@ -900,6 +926,7 @@ async def process_flair_assignment(reddit, post, config, subreddit, mod_name, ma
                         mark_action_as_completed(submission_id, 'comment')
                     else:
                         print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Skipping comment action due to empty comment body on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+                        mark_action_as_completed(submission_id, 'comment')
                 else:
                     # Submission over age, mark as completed.
                     mark_action_as_completed(submission_id, 'comment')
@@ -929,6 +956,15 @@ async def process_flair_assignment(reddit, post, config, subreddit, mod_name, ma
                     mark_action_as_completed(submission_id, 'ban')
                 else:
                     print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Skipping ban action due to invalid ban duration on ID: {disp_submission_id} for flair GUID: {flair_details['templateId']} in {disp_subreddit_displayname}") if debugmode else None
+                    try:
+                        subreddit_instance = await get_subreddit(reddit, subreddit.display_name)
+                        await subreddit.message(
+                            subject="Invalid Configuration",
+                            message=f"The Ban Action for [this submission](https://redd.it/{post.id}) under /r/{subreddit.display_name} was not applied for user /u/{post.author} due to an invalid ban duration in your configuration.\n\nYou may wish to review your settings for for flair GUID: {flair_details['templateId']} in your [flair_helper wiki page](https://www.reddit.com/r/{subreddit.display_name}/wiki/edit/flair_helper)\n\nYou may also want to manually ban the user: [Ban ](https://www.reddit.com/r/{subreddit.display_name}/about/banned/?user={post.author}) since this action may not have been completed automatically due to the configuration error."
+                        )
+                    except asyncpraw.exceptions.RedditAPIException as e:
+                        await error_handler(f"Error sending message to {subreddit.display_name}: {e}", notify_discord=True)
+                    mark_action_as_completed(submission_id, 'ban')
 
             if not is_action_completed(submission_id, 'unban') and 'unban' in flair_details and flair_details['unban']:
                 print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - unban triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
@@ -974,6 +1010,7 @@ async def process_flair_assignment(reddit, post, config, subreddit, mod_name, ma
                     mark_action_as_completed(submission_id, 'usernote')
                 else:
                     print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Skipping usernote action due to empty usernote note on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+                    mark_action_as_completed(submission_id, 'usernote')
 
             if not is_action_completed(submission_id, 'contributor') and 'contributor' in flair_details and flair_details['contributor']['enabled'] and flair_details['contributor']['action'] == 'add':
                 print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - add_contributor triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
@@ -1213,7 +1250,7 @@ last_startup_time_MonitorModLog = None
 last_flair_data_dict = {}
 
 # Primary Mod Log Monitor
-@reddit_error_handler
+#@reddit_error_handler
 async def monitor_mod_log(reddit, bot_username, max_concurrency=2):
 
     global last_startup_time_MonitorModLog
@@ -1422,10 +1459,85 @@ async def monitor_private_messages(reddit):
         await asyncio.sleep(120)  # Sleep for 60 seconds before the next iteration
 
 
+
+
+
+
+
+
+async def start_monitor_mod_log_task(reddit, bot_username):
+    while True:
+        try:
+            await monitor_mod_log(reddit, bot_username)
+        except Exception as e:
+            #print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Modqueue Task] Error in modqueue task: {str(e)}\nWaiting 60 seconds before restarting monitor_mod_queue") if debugmode else None
+            await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Modqueue Task] Error in mod log task: {str(e)}\nWaiting 60 seconds before restarting monitor_mod_log")
+            await asyncio.sleep(30)  # Wait for 60 seconds before restarting the task
+
+async def start_process_flair_actions_task(reddit, max_concurrency=2):
+    while True:
+        try:
+            await process_flair_actions(reddit, max_concurrency)
+        except Exception as e:
+            #print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Modmail Task] Error in modmail task: {str(e)}\nWaiting 60 seconds before restarting monitor_modmail_stream") if debugmode else None
+            await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Modmail Task] Error in flair actions task: {str(e)}\nWaiting 60 seconds before restarting monitor_modmail_stream")
+            await asyncio.sleep(20)  # Wait for 60 seconds before restarting the task
+
+async def start_monitor_private_messages_task(reddit):
+    while True:
+        try:
+            await monitor_private_messages(reddit)
+        except Exception as e:
+            #print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Submission Task] Error in submission task: {str(e)}\nWaiting 60 seconds before restarting start_submission_task") if debugmode else None
+            await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Submission Task] Error in private messages task: {str(e)}\nWaiting 60 seconds before restarting monitor_submission_stream")
+            await asyncio.sleep(120)  # Wait for 60 seconds before restarting the task
+
+
+
+
+
+
+
 last_startup_time_main = None
+
+running_tasks = {}
+
+async def add_task(task_name, task_func, *args):
+    global running_tasks
+    if task_name in running_tasks:
+        running_tasks[task_name].cancel()
+        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Task Management] Cancelling Task {task_name}") if debugmode else None
+        await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Task Management] Cancelling and restarting Task {task_name}") if debugmode else None
+    task = asyncio.create_task(task_func(*args))
+    running_tasks[task_name] = task
+    return task
+
+
+async def start_task(task_func, *args):
+    initial_delay = 30  # Start delay in seconds
+    max_delay = 600  # Max delay in seconds
+
+    while True:
+        try:
+            await task_func(*args)
+        except Exception as e:
+            delay = min(initial_delay * 2, max_delay)
+            await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error in {task_func.__name__} task: {str(e)}\nRetrying in {delay} seconds...")
+            print(f"Error in {task_func.__name__} task: {str(e)}\nRetrying in {delay} seconds...") if debugmode else None
+            await asyncio.sleep(delay)
+            initial_delay = delay  # Increment delay
+
+
 
 @reddit_error_handler
 async def bot_main():
+    global running_tasks
+
+    if verbosemode:
+        action_type = "[Initialization] "
+    else:
+        action_type = "[Initialization] "
+
     create_actions_database()
 
     global last_startup_time_main
@@ -1435,12 +1547,11 @@ async def bot_main():
         elapsed_time = current_time - last_startup_time_main
         if elapsed_time < 10:  # Check if the bot restarted within the last 10 seconds
             delay = 10 - elapsed_time
-            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Bot restarted within 10 seconds. Waiting for {delay} seconds before proceeding.")
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Bot restarted within 10 seconds. Waiting for {delay} seconds before proceeding.") if debugmode else None
             await asyncio.sleep(delay)
 
     last_startup_time_main = current_time
 
-    wiki_fetch_delay = 90
 
     print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair Helper 2 initializing asyncpraw") if debugmode else None
     reddit = asyncpraw.Reddit("fh2_login")
@@ -1452,24 +1563,29 @@ async def bot_main():
     print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair Helper 2 fetched bot username: {bot_username}") if debugmode else None
 
 
-    # Create separate tasks for each coroutine
-    bot_task = asyncio.create_task(monitor_mod_log(reddit, bot_username))
-    flair_actions_task = asyncio.create_task(process_flair_actions(reddit, max_concurrency=2))
-    pm_task = asyncio.create_task(monitor_private_messages(reddit))
-
-    tasks_to_gather = [bot_task, flair_actions_task, pm_task]
-
     # Check if the database is empty
     if is_config_database_empty():
         print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Database is empty. Fetching and caching configurations for all moderated subreddits.") if verbosemode else None
         await fetch_and_cache_configs(reddit, bot_username)
-    else:
-        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Database contains subreddit configurations. Proceeding with the delayed fetch and cache.") if verbosemode else None
-        wiki_cache_task = asyncio.create_task(delayed_fetch_and_cache_configs(reddit, bot_username, wiki_fetch_delay))
-        tasks_to_gather.append(wiki_cache_task)
 
+    max_concurrency = 2
+    wiki_fetch_delay = 90
 
-    await asyncio.gather(*tasks_to_gather)
+    await add_task('start_monitor_mod_log_task', start_task, monitor_mod_log, reddit, bot_username)
+    await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: {action_type}Starting Monitor Mod Log...")
+
+    await add_task('start_process_flair_actions_task', start_task, process_flair_actions, reddit, max_concurrency)
+    await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: {action_type}Starting Process Flair Actions...")
+
+    await add_task('start_monitor_private_messages_task', start_task, monitor_private_messages, reddit)
+    await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: {action_type}Starting Monitor Private Messages...")
+
+    await delayed_fetch_and_cache_configs(reddit, bot_username, wiki_fetch_delay)
+
+    try:
+        await asyncio.gather(*running_tasks.values())
+    except asyncio.CancelledError:
+        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: {action_type}Tasks cancelled") if debugmode else None
 
 
 def main():
