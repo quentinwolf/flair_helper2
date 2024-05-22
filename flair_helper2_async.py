@@ -498,6 +498,31 @@ async def process_subreddit_config(reddit, subreddit, bot_username, max_retries,
                 updated_config = convert_yaml_to_json(updated_config)
             except yaml.YAMLError as e:
                 await error_handler(f"Invalid YAML format for {subreddit.display_name}. Error details: {str(e)}", notify_discord=True)
+
+                wiki_revision = await get_latest_wiki_revision(subreddit)
+                mod_name = wiki_revision['author']
+                mod_name_str = str(mod_name)
+
+                # If both JSON and YAML parsing fail, send a notification to the subreddit and the mod who made the edit
+                subject = f"Flair Helper Configuration Error in /r/{subreddit.display_name}"
+                message = (
+                    f"The [Flair Helper configuration](https://www.reddit.com/r/{subreddit.display_name}/wiki/edit/flair_helper) for /r/{subreddit.display_name} is in an unsupported or invalid format.\n\n"
+                    f"Please check the [flair_helper wiki page](https://www.reddit.com/r/{subreddit.display_name}/wiki/edit/flair_helper) and ensure that the configuration is in a valid JSON or YAML format.\n\n"
+                    f"-----\n\nError details: {str(e)}\n\n-----\n\n"
+                    f"Flair Helper will continue using the previously cached configuration until the format is fixed.\n\n"
+                    f"You may wish to try running your config through [JSONLint](https://jsonlint.com) for JSON or [YAMLLint](http://www.yamllint.com/) for YAML to validate and find any errors first."
+                )
+                try:
+                    # Message the Subreddit
+                    #subreddit_instance = await reddit.subreddit(subreddit.display_name)
+                    #await subreddit_instance.message(subject, message)
+
+                    # Message the Moderator who made the change
+                    redditor = await reddit.redditor(mod_name_str)
+                    await redditor.message(subject, message)
+                except Exception as e:
+                    await error_handler(f"Error sending message to {subreddit.display_name} or moderator {mod_name}: {str(e)}", notify_discord=True)
+
                 return
 
 
