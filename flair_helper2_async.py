@@ -666,9 +666,11 @@ def send_webhook_notification(config, post, flair_text, mod_name, flair_guid):
         webhook_url = config[0]['GeneralConfiguration']['webhook']
         webhook = DiscordWebhook(url=webhook_url)
 
+        post_author_name = post.author.name if post.author else "[deleted]"
+
         # Create the embed
         embed = DiscordEmbed(title=f"{post.title}", url="https://www.reddit.com"+post.permalink, description="Post Flaired: "+post.link_flair_text, color=242424)
-        embed.add_embed_field(name="Author", value=post.author.name)
+        embed.add_embed_field(name="Author", value=post_author_name)
         embed.add_embed_field(name="Score", value=post.score)
         embed.add_embed_field(name="Created", value=datetime.utcfromtimestamp(post.created_utc).strftime('%b %u %Y %H:%M:%S UTC'))
         embed.add_embed_field(name="User Flair", value=flair_text)
@@ -1400,7 +1402,7 @@ async def monitor_mod_log(reddit, bot_username, max_concurrency=2):
 
                                 if actions:
                                     insert_actions_to_database(submission_id, actions, log_entry.mod.name, flair_guid)
-                                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Actions for flair GUID {disp_flair_guid} under submission {disp_submission_id} added to the database") if debugmode else None
+                                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Actions for flair GUID {disp_flair_guid} under submission {disp_submission_id} in /r/{disp_subreddit_displayname} added to the database") if debugmode else None
                                 else:
                                     print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: No actions found for flair GUID {disp_flair_guid}") if debugmode else None
                             else:
@@ -1488,35 +1490,41 @@ async def monitor_private_messages(reddit):
 
 
 
-
-
 async def start_monitor_mod_log_task(reddit, bot_username):
     while True:
         try:
+            await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Task] Mod Log Monitoring Started.")
             await monitor_mod_log(reddit, bot_username)
         except Exception as e:
             #print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Modqueue Task] Error in modqueue task: {str(e)}\nWaiting 60 seconds before restarting monitor_mod_queue") if debugmode else None
-            await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Modqueue Task] Error in mod log task: {str(e)}\nWaiting 60 seconds before restarting monitor_mod_log")
-            await asyncio.sleep(30)  # Wait for 60 seconds before restarting the task
+            await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Task] Error in monitor_mod_log task: {str(e)}\nWaiting 20 seconds before restarting monitor_mod_log")
+            await asyncio.sleep(20)
+            await add_task('start_monitor_mod_log_task', start_task, start_monitor_mod_log_task, reddit, bot_username)
+            return
 
 async def start_process_flair_actions_task(reddit, max_concurrency=2):
     while True:
         try:
+            await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Task] Flair Action Monitoring Started.")
             await process_flair_actions(reddit, max_concurrency)
         except Exception as e:
             #print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Modmail Task] Error in modmail task: {str(e)}\nWaiting 60 seconds before restarting monitor_modmail_stream") if debugmode else None
-            await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Modmail Task] Error in flair actions task: {str(e)}\nWaiting 60 seconds before restarting monitor_modmail_stream")
-            await asyncio.sleep(20)  # Wait for 60 seconds before restarting the task
+            await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Task] Error in process_flair_actions task: {str(e)}\nWaiting 20 seconds before restarting monitor_modmail_stream")
+            await asyncio.sleep(20)
+            await add_task('start_process_flair_actions_task', start_task, start_process_flair_actions_task, reddit, max_concurrency)
+            return
 
 async def start_monitor_private_messages_task(reddit):
     while True:
         try:
+            await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Task] Private Message Monitoring Started.")
             await monitor_private_messages(reddit)
         except Exception as e:
             #print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Submission Task] Error in submission task: {str(e)}\nWaiting 60 seconds before restarting start_submission_task") if debugmode else None
-            await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Submission Task] Error in private messages task: {str(e)}\nWaiting 60 seconds before restarting monitor_submission_stream")
-            await asyncio.sleep(120)  # Wait for 60 seconds before restarting the task
-
+            await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Task] Error in monitor_private_messages task: {str(e)}\nWaiting 20 seconds before restarting monitor_submission_stream")
+            await asyncio.sleep(20)
+            await add_task('start_monitor_private_messages_task', start_task, start_monitor_private_messages_task, reddit)
+            return
 
 
 
@@ -1527,30 +1535,37 @@ last_startup_time_main = None
 
 running_tasks = {}
 
+task_semaphore = asyncio.Semaphore(3)  # Limit to 3 concurrent task restarts
+
 async def add_task(task_name, task_func, *args):
     global running_tasks
-    if task_name in running_tasks:
-        running_tasks[task_name].cancel()
-        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Task Management] Cancelling Task {task_name}") if debugmode else None
-        await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Task Management] Cancelling and restarting Task {task_name}") if debugmode else None
-    task = asyncio.create_task(task_func(*args))
-    running_tasks[task_name] = task
-    return task
+    async with task_semaphore:
+        if task_name in running_tasks:
+            running_tasks[task_name].cancel()
+            await error_handler(f"[Task Management] Cancelling Task {task_name}", notify_discord=True)
+            await asyncio.sleep(1)  # Wait for a short duration to allow the task to be cancelled properly
+            await error_handler(f"[Task Management] Restarting Task {task_name}", notify_discord=True)
+        task = asyncio.create_task(task_func(*args))
+        running_tasks[task_name] = task
+        return task
+
 
 
 async def start_task(task_func, *args):
-    initial_delay = 30  # Start delay in seconds
-    max_delay = 600  # Max delay in seconds
+    initial_delay = 10  # Initial delay in seconds
+    max_delay = 160  # Max delay in seconds
+    delay = initial_delay
 
     while True:
         try:
             await task_func(*args)
         except Exception as e:
-            delay = min(initial_delay * 2, max_delay)
-            await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error in {task_func.__name__} task: {str(e)}\nRetrying in {delay} seconds...")
-            print(f"Error in {task_func.__name__} task: {str(e)}\nRetrying in {delay} seconds...") if debugmode else None
+            #print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Task] Error in {task_func.__name__} task: {str(e)}\nRetrying in {delay} seconds...") if debugmode else None
+            await error_handler(f"[Start Task] Error in {task_func.__name__} task: {str(e)}\nRetrying in {delay} seconds...", notify_discord=True)
             await asyncio.sleep(delay)
-            initial_delay = delay  # Increment delay
+            delay = min(delay * 2, max_delay)  # Double the delay, capped at max_delay
+        else:
+            delay = initial_delay  # Reset the delay on successful execution
 
 
 
@@ -1596,13 +1611,13 @@ async def bot_main():
     max_concurrency = 2
     wiki_fetch_delay = 90
 
-    await add_task('start_monitor_mod_log_task', start_task, monitor_mod_log, reddit, bot_username)
+    await add_task('start_monitor_mod_log_task', start_task, start_monitor_mod_log_task, reddit, bot_username)
     await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: {action_type}Starting Monitor Mod Log...")
 
-    await add_task('start_process_flair_actions_task', start_task, process_flair_actions, reddit, max_concurrency)
+    await add_task('start_process_flair_actions_task', start_task, start_process_flair_actions_task, reddit, max_concurrency)
     await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: {action_type}Starting Process Flair Actions...")
 
-    await add_task('start_monitor_private_messages_task', start_task, monitor_private_messages, reddit)
+    await add_task('start_monitor_private_messages_task', start_task, start_monitor_private_messages_task, reddit)
     await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: {action_type}Starting Monitor Private Messages...")
 
     await delayed_fetch_and_cache_configs(reddit, bot_username, wiki_fetch_delay)
