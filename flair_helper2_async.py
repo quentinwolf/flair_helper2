@@ -774,35 +774,52 @@ async def process_flair_assignment(reddit, post, config, subreddit, mod_name, ma
         return
 
     if flair_guid and any(flair['templateId'] == flair_guid for flair in config[1:]):
-
         print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair details: {flair_details}") if verbosemode else None
 
-        await post.load()
-        # Now that post data is loaded, ensure that author data is loaded
-        if post.author:
-            await post.author.load()
-            if hasattr(post.author, 'is_suspended') and post.author.is_suspended:
-                author_id = None
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Skipping author ID on ID: {disp_submission_id} for suspended user: {post.author.name}") if debugmode else None
+        try:
+            await post.load()
+            # Now that post data is loaded, ensure that author data is loaded
+            if post.author:
+                await post.author.load()
+                if hasattr(post.author, 'is_suspended') and post.author.is_suspended:
+                    author_id = None
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Skipping author ID on ID: {disp_submission_id} for suspended user: {post.author.name}") if debugmode else None
+                else:
+                    author_id = post.author.id
             else:
-                author_id = post.author.id
-        else:
-            # Handle the case where the post may not have an author (e.g., deleted account)
-            author_id = None
+                # Handle the case where the post may not have an author (e.g., deleted account)
+                author_id = None
 
-        if post.subreddit:
-            await post.subreddit.load()
-            subreddit_id = post.subreddit.id
-        else:
-            # Handle the case where the post may not have an author (e.g., deleted account)
-            subreddit_id = None
+            if post.subreddit:
+                await post.subreddit.load()
+                subreddit_id = post.subreddit.id
+            else:
+                # Handle the case where the post may not have an author (e.g., deleted account)
+                subreddit_id = None
 
-        # Only fetch the current flair if the author is not deleted or suspended
-        if not is_author_deleted_or_suspended:
-            current_flair = await fetch_user_flair(subreddit, post.author.name)  # Fetch the current flair asynchronously
-        else:
-            current_flair = None
+            # Only fetch the current flair if the author is not deleted or suspended
+            if not is_author_deleted_or_suspended:
+                current_flair = await fetch_user_flair(subreddit, post.author.name)  # Fetch the current flair asynchronously
+            else:
+                current_flair = None
 
+            print(f"User Info... \nis_author_deleted_or_suspended: {is_author_deleted_or_suspended}\npost.author: {post.author}\nauthor_id: {author_id}") if verbosemode else None
+
+        except (asyncprawcore.exceptions.NotFound, asyncprawcore.exceptions.Forbidden) as e:
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error loading post or author data for ID: {disp_submission_id}. Post may be removed or author may be shadowbanned/deleted. Skipping flair assignment.") if debugmode else None
+            mark_action_as_completed(submission_id, 'comment')
+            mark_action_as_completed(submission_id, 'approve')
+            mark_action_as_completed(submission_id, 'remove')
+            mark_action_as_completed(submission_id, 'lock')
+            mark_action_as_completed(submission_id, 'modlogReason')
+            mark_action_as_completed(submission_id, 'ban')
+            mark_action_as_completed(submission_id, 'unban')
+            mark_action_as_completed(submission_id, 'userFlair')
+            mark_action_as_completed(submission_id, 'usernote')
+            mark_action_as_completed(submission_id, 'contributor')
+            mark_action_as_completed(submission_id, 'sendToWebhook')
+            await asyncio.sleep(2)
+            return
 
         # Initialize defaults if the user has no current flair
         flair_text = ''
@@ -889,14 +906,20 @@ async def process_flair_assignment(reddit, post, config, subreddit, mod_name, ma
 
         if not is_action_completed(submission_id, 'remove') and 'remove' in flair_details and flair_details['remove']:
             print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - remove triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
-            mod_note = flair_details['usernote']['note'][:100] if 'usernote' in flair_details and flair_details['usernote']['enabled'] else ''
 
-            if flair_details.get('modlogReason'):
-                mod_note = flair_details['modlogReason'][:100]  # Truncate to 100 characters
+            if post.removed:
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Post {disp_submission_id} is already removed. Marking action as completed.") if debugmode else None
+                mark_action_as_completed(submission_id, 'remove')
+                mark_action_as_completed(submission_id, 'modlogReason')
+            else:
+                mod_note = flair_details['usernote']['note'][:100] if 'usernote' in flair_details and flair_details['usernote']['enabled'] else ''
 
-            await post.mod.remove(spam=False, mod_note=mod_note)
-            mark_action_as_completed(submission_id, 'remove')
-            mark_action_as_completed(submission_id, 'modlogReason')
+                if flair_details.get('modlogReason'):
+                    mod_note = flair_details['modlogReason'][:100]  # Truncate to 100 characters
+
+                await post.mod.remove(spam=False, mod_note=mod_note)
+                mark_action_as_completed(submission_id, 'remove')
+                mark_action_as_completed(submission_id, 'modlogReason')
 
         if not flair_details.get('remove') and not is_action_completed(submission_id, 'modlogReason') and flair_details.get('modlogReason'):
             print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - modlogReason triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
@@ -905,13 +928,23 @@ async def process_flair_assignment(reddit, post, config, subreddit, mod_name, ma
 
         if not is_action_completed(submission_id, 'lock') and 'lock' in flair_details and flair_details['lock']:
             print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - lock triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
-            await post.mod.lock()
-            mark_action_as_completed(submission_id, 'lock')
+
+            if post.locked:
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Post {disp_submission_id} is already locked. Marking action as completed.") if debugmode else None
+                mark_action_as_completed(submission_id, 'lock')
+            else:
+                await post.mod.lock()
+                mark_action_as_completed(submission_id, 'lock')
 
         if not is_action_completed(submission_id, 'spoiler') and 'spoiler' in flair_details and flair_details['spoiler']:
             print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - spoiler triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
-            await post.mod.spoiler()
-            mark_action_as_completed(submission_id, 'spoiler')
+
+            if post.spoiler:
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Post {disp_submission_id} is already spoilered. Marking action as completed.") if debugmode else None
+                mark_action_as_completed(submission_id, 'spoiler')
+            else:
+                await post.mod.spoiler()
+                mark_action_as_completed(submission_id, 'spoiler')
 
         if not is_action_completed(submission_id, 'clearPostFlair') and 'clearPostFlair' in flair_details and flair_details['clearPostFlair']:
             print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - remove_link_flair triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
@@ -1278,7 +1311,7 @@ last_flair_data_dict = {}
 
 # Primary Mod Log Monitor
 #@reddit_error_handler
-async def monitor_mod_log(reddit, bot_username, max_concurrency=2):
+async def monitor_mod_log(reddit, bot_username, max_concurrency=1):
 
     global last_startup_time_MonitorModLog
 
@@ -1340,9 +1373,9 @@ async def monitor_mod_log(reddit, bot_username, max_concurrency=2):
                                 errors_logger.error(f"monitor_mod_log: Flair Helper wiki page not found in /r/{log_entry.subreddit}")
 
                     elif (log_entry.action == 'editflair'
-                        and log_entry.mod not in accounts_to_ignore
-                        and log_entry.target_fullname is not None
-                        and log_entry.target_fullname.startswith('t3_')):
+                          and log_entry.mod not in accounts_to_ignore
+                          and log_entry.target_fullname is not None
+                          and log_entry.target_fullname.startswith('t3_')):
                         # This is a link (submission) flair edit
                         submission_id = log_entry.target_fullname[3:]  # Remove the 't3_' prefix
                         config = get_cached_config(log_entry.subreddit)
@@ -1353,66 +1386,64 @@ async def monitor_mod_log(reddit, bot_username, max_concurrency=2):
 
                             if flair_guid is not None:
                                 last_flair_data_key = f"{submission_id}_{flair_guid}"
+                                print(f"last_flair_data_key: {last_flair_data_key}") if debugmode else None
                                 current_time = time.time()
 
-                                if last_flair_data_key in last_flair_data_dict and current_time - last_flair_data_dict[last_flair_data_key] < config[0]['GeneralConfiguration'].get('ignore_same_flair_seconds', 60):
-                                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Ignoring duplicate flair assignment for submission {submission_id} with flair GUID {flair_guid}") if debugmode else None
-                                    continue
+                                if last_flair_data_key not in last_flair_data_dict or current_time - last_flair_data_dict[last_flair_data_key] >= config[0]['GeneralConfiguration'].get('ignore_same_flair_seconds', 60):
+                                    last_flair_data_dict[last_flair_data_key] = current_time
 
-                                last_flair_data_dict[last_flair_data_key] = current_time
+                                    if colored_console_output:
+                                        disp_flair_guid = colored(flair_guid, "magenta")
+                                    else:
+                                        disp_flair_guid = flair_guid
 
-                            if colored_console_output:
-                                disp_flair_guid = colored(flair_guid, "magenta")
-                            else:
-                                disp_flair_guid = flair_guid
+                                    flair_details = next((flair for flair in config[1:] if flair['templateId'] == flair_guid), None)
 
-                            flair_details = next((flair for flair in config[1:] if flair['templateId'] == flair_guid), None)
+                                    if flair_details is not None:
+                                        actions = []
 
-                            if flair_details is not None:
-                                actions = []
+                                        if flair_details.get('approve', False):
+                                            actions.append('approve')
+                                        if flair_details.get('remove', False):
+                                            actions.append('remove')
+                                        if flair_details.get('lock', False):
+                                            actions.append('lock')
+                                        if flair_details.get('spoiler', False):
+                                            actions.append('spoiler')
+                                        if flair_details.get('clearPostFlair', False):
+                                            actions.append('clearPostFlair')
+                                        if flair_details.get('modlogReason', '').strip():
+                                            actions.append('modlogReason')
+                                        if flair_details.get('comment', {}).get('enabled', False):
+                                            actions.append('comment')
+                                        if flair_details.get('nukeUserComments', False):
+                                            actions.append('nukeUserComments')
+                                        if flair_details.get('usernote', {}).get('enabled', False):
+                                            actions.append('usernote')
+                                        if flair_details.get('contributor', {}).get('enabled', False):
+                                            actions.append('contributor')
+                                        if flair_details.get('userFlair', {}).get('enabled', False):
+                                            actions.append('userFlair')
+                                        if flair_details.get('ban', {}).get('enabled', False):
+                                            actions.append('ban')
+                                        if flair_details.get('unban', False):
+                                            actions.append('unban')
+                                        if flair_details.get('sendToWebhook', False):
+                                            actions.append('sendToWebhook')
 
-                                if flair_details.get('approve', False):
-                                    actions.append('approve')
-                                if flair_details.get('remove', False):
-                                    actions.append('remove')
-                                if flair_details.get('lock', False):
-                                    actions.append('lock')
-                                if flair_details.get('spoiler', False):
-                                    actions.append('spoiler')
-                                if flair_details.get('clearPostFlair', False):
-                                    actions.append('clearPostFlair')
-                                if flair_details.get('modlogReason', '').strip():
-                                    actions.append('modlogReason')
-                                if flair_details.get('comment', {}).get('enabled', False):
-                                    actions.append('comment')
-                                if flair_details.get('nukeUserComments', False):
-                                    actions.append('nukeUserComments')
-                                if flair_details.get('usernote', {}).get('enabled', False):
-                                    actions.append('usernote')
-                                if flair_details.get('contributor', {}).get('enabled', False):
-                                    actions.append('contributor')
-                                if flair_details.get('userFlair', {}).get('enabled', False):
-                                    actions.append('userFlair')
-                                if flair_details.get('ban', {}).get('enabled', False):
-                                    actions.append('ban')
-                                if flair_details.get('unban', False):
-                                    actions.append('unban')
-                                if flair_details.get('sendToWebhook', False):
-                                    actions.append('sendToWebhook')
-
-                                if actions:
-                                    insert_actions_to_database(submission_id, actions, log_entry.mod.name, flair_guid)
-                                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Actions for flair GUID {disp_flair_guid} under submission {disp_submission_id} in /r/{disp_subreddit_displayname} added to the database") if debugmode else None
+                                        if actions:
+                                            insert_actions_to_database(submission_id, actions, log_entry.mod.name, flair_guid)
+                                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Actions for flair GUID {disp_flair_guid} under submission {disp_submission_id} in /r/{disp_subreddit_displayname} added to the database") if debugmode else None
+                                        else:
+                                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: No actions found for flair GUID {disp_flair_guid}") if debugmode else None
+                                    else:
+                                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair GUID {disp_flair_guid} not found in the configuration") if debugmode else None
                                 else:
-                                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: No actions found for flair GUID {disp_flair_guid}") if debugmode else None
+                                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Ignoring duplicate flair assignment for submission {submission_id} with flair GUID {flair_guid}") if debugmode else None
                             else:
-                                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair GUID {disp_flair_guid} not found in the configuration") if debugmode else None
+                                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair GUID not found for submission {submission_id}") if debugmode else None
                         else:
                             print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Configuration not found for /r/{disp_subreddit_displayname}") if debugmode else None
-
-                    else:
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Ignoring action: {log_entry.action} in /r/{disp_subreddit_displayname}") if verbosemode else None
-
 
         except asyncprawcore.exceptions.RequestException as e:
             print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error in mod log stream: {str(e)}. Retrying...") if debugmode else None
@@ -1455,6 +1486,13 @@ async def process_flair_actions(reddit, max_concurrency=2):
         for submission_id, mod_name in pending_submission_ids:
             if submission_id not in unique_submission_ids:
                 unique_submission_ids.add(submission_id)
+
+                # Check if all actions for the submission are completed
+                if is_submission_completed(submission_id):
+                    delete_completed_actions(submission_id)
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: All actions for submission {submission_id} completed. Skipping processing.") if debugmode else None
+                    continue
+
                 if colored_console_output:
                     disp_modname = colored(mod_name, "green", attrs=["underline", "bold"])
                 else:
@@ -1484,6 +1522,8 @@ async def monitor_private_messages(reddit):
     while True:
         await handle_private_messages(reddit)
         await asyncio.sleep(120)  # Sleep for 60 seconds before the next iteration
+
+
 
 
 
@@ -1525,6 +1565,7 @@ async def start_monitor_private_messages_task(reddit):
             await asyncio.sleep(20)
             await add_task('start_monitor_private_messages_task', start_task, start_monitor_private_messages_task, reddit)
             return
+
 
 
 
