@@ -1073,17 +1073,17 @@ async def process_flair_assignment(reddit, post, config, subreddit, mod_name, ma
                     flair_css_class = flair_css_class.replace(f"{{{{{placeholder}}}}}", str(value))
 
                 try:
-                    if flair_text or flair_css_class:
-                        # If text or CSS class is provided, use them (this takes precedence)
-                        await subreddit.flair.set(post.author, text=flair_text, css_class=flair_css_class)
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - Set user flair text to: '{flair_text}', CSS class to: '{flair_css_class}'") if debugmode else None
-                    elif flair_template_id:
-                        # If no text/CSS provided but template ID is, use the template ID
+                    if flair_template_id:
+                        # If template ID is provided, use it (this takes precedence)
                         await subreddit.flair.set(post.author, flair_template_id=flair_template_id)
                         print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - Set user flair template ID to: '{flair_template_id}'") if debugmode else None
+                    elif flair_text or flair_css_class:
+                        # If no template ID but text or CSS class is provided, use them
+                        await subreddit.flair.set(post.author, text=flair_text, css_class=flair_css_class)
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - Set user flair text to: '{flair_text}', CSS class to: '{flair_css_class}'") if debugmode else None
                     else:
                         print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - No flair settings provided, skipping flair assignment") if debugmode else None
-
+        
                     mark_action_as_completed(submission_id, 'userFlair')
                 except Exception as e:
                     await error_handler(f"Error setting user flair for {post.author} in {subreddit.display_name}: {str(e)}", notify_discord=True)
