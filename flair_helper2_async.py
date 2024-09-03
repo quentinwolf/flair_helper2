@@ -5,7 +5,9 @@ import asyncprawcore
 import sqlite3
 import yaml
 import re
+from collections import defaultdict
 from datetime import datetime, timedelta
+from typing import Callable, Any, Dict
 import time
 import zlib
 import base64
@@ -21,6 +23,19 @@ from asyncprawcore import NotFound
 from discord_webhook import DiscordWebhook, DiscordEmbed
 
 import config  # Import your config.py
+
+
+if config.telegram_bot_control:
+    # For optionally being able to restart the bot via a Telegram bot username
+    from telebot import types
+    from telebot.apihelper import ApiTelegramException
+    from telebot.asyncio_helper import ApiTelegramException
+    from telebot.async_telebot import AsyncTeleBot
+    from telebot.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+
+    telegram_bot = AsyncTeleBot(config.telegram_TOKEN)
+    admin_ids = config.telegram_admin_ids
+
 
 debugmode = config.debugmode
 verbosemode = config.verbosemode
@@ -50,6 +65,131 @@ database_lock = asyncio.Lock()
 
 if colored_console_output:
     from termcolor import colored, cprint  # https://pypi.org/project/termcolor/
+
+
+def check_restriction_status(message):
+    restriction_status = read_rate_limit_config()
+
+    # Immediate return for admin messages to ensure URL processing
+    if message.from_user.id in config.telegram_admin_ids:
+        return "admin_private"
+    else:
+        return "unauthorized"
+
+
+@telegram_bot.message_handler(commands=['status'])
+async def handle_status_command(message):
+    if message.chat.type in ("private") and message.chat.id in config.telegram_admin_ids:
+        status_message = "Flair Helper 2 Status Report:\n\n"
+
+        # Current time
+        status_message += f"Current time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+
+        # Memory usage
+        import psutil
+        process = psutil.Process()
+        memory_usage = process.memory_info().rss / 1024 / 1024  # in MB
+        status_message += f"Memory usage: {memory_usage:.2f} MB\n\n"
+
+        # Running tasks
+        status_message += "Running Tasks:\n"
+        for task_name in running_tasks.keys():
+            status_message += f"- {task_name}\n"
+        status_message += "\n"
+
+        # Monitored subreddits
+        conn = sqlite3.connect('flair_helper_configs.db')
+        c = conn.cursor()
+        c.execute("SELECT subreddit FROM configs")
+        subreddits = c.fetchall()
+        subreddit_count = len(subreddits)
+
+        status_message += f"Monitored Subreddits: {subreddit_count}\n"
+        if subreddit_count > 0:
+            status_message += "Subreddits:\n"
+            for subreddit in sorted(subreddits, key=lambda x: x[0].lower()):
+                status_message += f"- {subreddit[0]}\n"
+        status_message += "\n"
+
+        # Pending actions in database
+        conn = sqlite3.connect('flair_helper_actions.db')
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM actions WHERE completed = 0")
+        pending_count = c.fetchone()[0]
+
+        if pending_count > 0:
+            status_message += f"Pending Actions: {pending_count}\n"
+            c.execute("SELECT submission_id, action, mod_name FROM actions WHERE completed = 0 LIMIT 20")
+            pending_actions = c.fetchall()
+            status_message += "Recent pending actions (up to 20):\n"
+            for action in pending_actions:
+                status_message += f"- Submission {action[0]}: {action[1]} by {action[2]}\n"
+        else:
+            status_message += "No pending actions in the actions database.\n"
+
+        conn.close()
+
+        await telegram_bot.send_message(chat_id=message.chat.id, text=status_message)
+
+
+@telegram_bot.message_handler(commands=['restart'])
+async def handle_restart_command(message):
+    if message.chat.type in ("private") and message.chat.id in config.telegram_admin_ids:
+        #await telegram_bot.send_message(chat_id=message.chat.id, text="Restarting bot...")
+        #os._exit(0)  # Forcefully exit the process
+        user_name = message.from_user.username or message.from_user.first_name
+        await error_handler(f"Telegram 'restart' command received from {user_name}", notify_discord=True)
+
+        try:
+            await telegram_bot.send_message(chat_id=message.chat.id, text=f"Restarting start_process_flair_actions_task...")
+            await add_task('Flair Helper - Process Flair Actions', start_task, start_process_flair_actions_task, reddit, max_concurrency, max_processing_retries, processing_retry_delay)
+            #await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: {action_type}Starting Process Flair Actions...")
+        except Exception as e:
+            await telegram_bot.send_message(chat_id=message.chat.id, text=f"**There was an error restarting the start_process_flair_actions_task...**\n Exception: {e}")
+
+        try:
+            await telegram_bot.send_message(chat_id=message.chat.id, text=f"Restarting start_monitor_mod_log_task...")
+            await add_task('Reddit - Monitor Mod Log', start_task, start_monitor_mod_log_task, reddit, bot_username)
+            #await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: {action_type}Starting Monitor Mod Log...")
+        except Exception as e:
+            await telegram_bot.send_message(chat_id=message.chat.id, text=f"**There was an error restarting the start_monitor_mod_log_task...**\n Exception: {e}")
+
+        try:
+            await telegram_bot.send_message(chat_id=message.chat.id, text=f"Restarting start_monitor_private_messages_task...")
+            await add_task('Reddit - Monitor Private Messages', start_task, start_monitor_private_messages_task, reddit)
+            #await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: {action_type}Starting Monitor Private Messages...")
+        except Exception as e:
+            await telegram_bot.send_message(chat_id=message.chat.id, text=f"**There was an error restarting the start_monitor_private_messages_task...**\n Exception: {e}")
+
+
+
+@telegram_bot.message_handler(commands=['kill'])
+async def handle_restart_command(message):
+    if message.chat.type in ("private") and message.chat.id in config.telegram_admin_ids:
+
+        user_name = message.from_user.username or message.from_user.first_name
+        await error_handler(f"Telegram 'kill' command received from {user_name}", notify_discord=True)
+
+        await telegram_bot.send_message(chat_id=message.chat.id, text="Forcefully Killing Bot...")
+        os._exit(0)  # Forcefully exit the process
+
+
+@telegram_bot.message_handler(func=lambda message: True, content_types=['new_chat_members'])
+async def handle_new_chat_members(message: Message):
+    # Check if our bot is among the new members
+    for member in message.new_chat_members:
+        if member.id == telegram_bot_id:  # Use telegram_bot_id instead of making another async call
+            timestr = time.strftime("%Y-%m-%d %H:%M:%S ")
+            chat_id = message.chat.id
+            user_name = message.from_user.username or message.from_user.first_name
+            group_name = message.chat.title
+            actions_str = f"**BOT LEFT {message.chat.type}** | A User {user_name} Attempted action under {message.chat.type}: {group_name} ID: {chat_id}"
+            print(f"{timestr} {actions_str}") if debugmode or verbosemode else None
+            actions_logger.info(actions_str)
+            await telegram_bot.send_message(128629760, f"**BOT LEFT {message.chat.type}** | A User {user_name} attempted action under {message.chat.type}: {group_name} ID: {chat_id}")
+
+            await telegram_bot.leave_chat(message.chat.id)
+
 
 
 async def error_handler(error_message, notify_discord=False):
@@ -137,6 +277,50 @@ async def get_subreddit(reddit, subreddit_name):
     #subreddit_cache[subreddit_name] = subreddit
     #print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: get_subreddit: subreddit_name NOT in subreddit_cache: subreddit_name: {subreddit_name}, subreddit: {subreddit}") if debugmode else None
     return subreddit
+
+
+
+async def discord_status_notification(message):
+    if discord_bot_notifications:
+        try:
+            webhook = DiscordWebhook(url=discord_webhook_url)
+            embed = DiscordEmbed(title="Flair Helper 2 Status Notification", description=message, color=242424)
+            webhook.add_embed(embed)
+            response = webhook.execute()
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Discord status notification sent: {message}") if debugmode else None
+        except Exception as e:
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error sending Discord status notification: {str(e)}") if debugmode else None
+
+
+async def send_failure_notification(submission_id, mod_name, error_message):
+    # Fetch pending actions
+    pending_actions = get_pending_actions(submission_id)
+
+    # Create a formatted list of pending actions
+    action_list = "\n".join([f"- {action}" for action in pending_actions])
+
+    # Create the short link
+    short_link = f"https://redd.it/{submission_id}"
+
+    notification = (
+        f"Failed to process submission {submission_id} after {max_retries} attempts.\n"
+        f"Last error: {error_message}\n"
+        f"Mod: {mod_name}\n"
+        f"Short link: {short_link}\n\n"
+        f"Pending actions:\n{action_list}"
+    )
+
+    # Send Discord notification
+    if discord_bot_notifications:
+        await discord_status_notification(notification)
+
+    # Send Telegram notification
+    if config.telegram_bot_control:
+        for admin_id in config.telegram_admin_ids:
+            await telegram_bot.send_message(admin_id, notification)
+
+    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Sent failure notification for submission {submission_id}") if debugmode else None
+
 
 
 # Create local sqlite db to cache/store Wiki Configs for all subs ones bot moderates
@@ -236,12 +420,28 @@ def get_pending_submission_ids_from_database():
     conn.close()
     return pending_submission_ids
 
+def get_pending_actions(submission_id):
+    conn = sqlite3.connect('flair_helper_actions.db')
+    c = conn.cursor()
+    c.execute("SELECT action FROM actions WHERE submission_id = ? AND completed = 0", (submission_id,))
+    pending_actions = [row[0] for row in c.fetchall()]
+    conn.close()
+    return pending_actions
+
 def mark_action_as_completed(submission_id, action):
     conn = sqlite3.connect('flair_helper_actions.db')
     c = conn.cursor()
     c.execute("UPDATE actions SET completed = 1 WHERE submission_id = ? AND action = ?", (submission_id, action))
     conn.commit()
     conn.close()
+
+def mark_all_actions_completed(submission_id):
+    conn = sqlite3.connect('flair_helper_actions.db')
+    c = conn.cursor()
+    c.execute("UPDATE actions SET completed = 1 WHERE submission_id = ?", (submission_id,))
+    conn.commit()
+    conn.close()
+    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Marked all actions as completed for submission {submission_id} due to repeated failures") if debugmode else None
 
 def is_action_completed(submission_id, action):
     conn = sqlite3.connect('flair_helper_actions.db')
@@ -362,19 +562,6 @@ def convert_yaml_to_json(yaml_config):
     print(f"YAML to JSON Conversion complete.")
 
     return json_config
-
-
-
-async def discord_status_notification(message):
-    if discord_bot_notifications:
-        try:
-            webhook = DiscordWebhook(url=discord_webhook_url)
-            embed = DiscordEmbed(title="Flair Helper 2 Status Notification", description=message, color=242424)
-            webhook.add_embed(embed)
-            response = webhook.execute()
-            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Discord status notification sent: {message}") if debugmode else None
-        except Exception as e:
-            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error sending Discord status notification: {str(e)}") if debugmode else None
 
 
 @reddit_error_handler
@@ -616,6 +803,54 @@ def add_usernote(notes, author, note_text, link, mod_index, usernote_type_index)
     }
     notes[author]["ns"].append(new_note)
 
+
+async def add_escalating_ban_note(subreddit, author, ban_duration, link, mod_name):
+    if ban_duration == 0:
+        note_text = "FH-Ban-permanent"
+    else:
+        note_text = f"FH-Ban-{ban_duration}"
+    usernote_type_name = "flair_helper_note"
+    await update_usernotes(subreddit, author, note_text, link, mod_name, usernote_type_name)
+
+
+@reddit_error_handler
+async def get_usernotes(subreddit, username, max_retries=3, retry_delay=5):
+    async with usernotes_lock:
+        for attempt in range(max_retries):
+            try:
+                usernotes_wiki = await subreddit.wiki.get_page("usernotes")
+                usernotes_content = usernotes_wiki.content_md
+                usernotes_data = json.loads(usernotes_content)
+
+                if 'blob' not in usernotes_data:
+                    return []  # No usernotes exist
+
+                decompressed_notes = decompress_notes(usernotes_data['blob'])
+
+                if username not in decompressed_notes:
+                    return []  # No notes for this user
+
+                user_notes = decompressed_notes[username]['ns']
+
+                # Convert the notes to the format we need for ban tracking
+                formatted_notes = []
+                for note in user_notes:
+                    note_text = note['n']
+                    if note_text.startswith("[FH] FH-Ban-"):
+                        ban_value = note_text.split("FH-Ban-")[1]
+                        formatted_notes.append(ban_value)
+
+                return formatted_notes
+
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                else:
+                    error_message = f"Failed to retrieve usernotes for user {username}"
+                    print(error_message) if debugmode else None
+                    await error_handler(error_message, notify_discord=True)
+                    return []  # Return an empty list if we can't retrieve the notes
+
 @reddit_error_handler
 async def update_usernotes(subreddit, author, note_text, link, mod_name, usernote_type_name=None, max_retries=3, retry_delay=5):
     async with usernotes_lock:
@@ -740,87 +975,609 @@ async def fetch_user_flair(subreddit, username):
     #print(f"flair: None") if debugmode else None
     return None  # If no flair is set
 
-# Primary process to handle any flair changes that appear in the logs
-@reddit_error_handler
-async def process_flair_assignment(reddit, post, config, subreddit, mod_name, max_retries=3, retry_delay=5):
 
-    #submission_id = target_fullname[3:]  # Remove the 't3_' prefix
-    #post = await reddit.submission(submission_id)
-    flair_guid = getattr(post, 'link_flair_template_id', None)  # Use getattr to safely retrieve the attribute
+def get_display_name(author, use_color=False):
+    if author is None:
+        return colored("[deleted]", "red") if use_color else "[deleted]"
+    name = getattr(author, 'name', '[unknown]')
+    return colored(name, "light_red") if use_color else name
+
+
+def parse_ban_duration_list(duration_str):
+    return [int(d) if d.isdigit() else 0 for d in duration_str.split(',')]
+
+
+async def get_next_ban_duration(subreddit, user, duration_list):
+    print(f"Debug: Entering get_next_ban_duration for user {user}") if verbosemode else None
+    print(f"Debug: Duration list: {duration_list}") if verbosemode else None
+
+    usernotes = await get_usernotes(subreddit, user)
+    print(f"Debug: Retrieved usernotes: {usernotes}") if verbosemode else None
+
+    if not usernotes:
+        next_duration = duration_list[0]
+        print(f"Debug: No relevant notes, returning first duration: {next_duration}") if verbosemode else None
+        return next_duration
+
+    highest_duration = max([int(note) if note != 'permanent' else float('inf') for note in usernotes])
+    print(f"Debug: Highest previous duration: {highest_duration}") if verbosemode else None
+
+    if highest_duration == float('inf'):
+        return 0  # Return 0 for permanent ban
+
+    next_duration = duration_list[-1]  # Default to the last (highest) duration
+    for duration in duration_list:
+        if duration > highest_duration:
+            next_duration = duration
+            break
+
+    print(f"Debug: Returning next duration: {next_duration}") if verbosemode else None
+    return next_duration
+
+
+def get_ban_duration_string(duration):
+    if duration == 0:
+        return "permanently banned", "permanent"
+    elif duration == 1:
+        return "banned for 1 day", "1"
+    else:
+        return f"banned for {duration} days", str(duration)
+
+
+async def apply_escalating_ban(subreddit, user, duration_list, ban_message, mod_note, mod_name, link):
+    try:
+        print(f"Debug: Entering apply_escalating_ban for user {user.name}") if verbosemode else None
+        print(f"Debug: Ban Duration list: {duration_list}") if debugmode or verbosemode else None
+
+        next_duration = await get_next_ban_duration(subreddit, user.name, duration_list)
+        print(f"Debug: Next duration: {next_duration}") if debugmode or verbosemode else None
+
+        ban_duration_string, ban_duration_number = get_ban_duration_string(next_duration)
+        print(f"Debug: Ban duration string: {ban_duration_string}") if verbosemode else None
+        print(f"Debug: Ban duration number: {ban_duration_number}") if verbosemode else None
+
+        # Replace the placeholders in the ban message and mod note
+        ban_message = ban_message.replace("{{ban_duration}}", ban_duration_string)
+        ban_message = ban_message.replace("{{ban_duration_number}}", ban_duration_number)
+        mod_note = mod_note.replace("{{ban_duration}}", ban_duration_string)
+        mod_note = mod_note.replace("{{ban_duration_number}}", ban_duration_number)
+
+        print(f"Debug: Final ban message: {ban_message}") if verbosemode else None
+        print(f"Debug: Final mod note: {mod_note}") if verbosemode else None
+
+        if next_duration == 0:
+            await subreddit.banned.add(user, ban_message=ban_message, note=mod_note)
+        else:
+            await subreddit.banned.add(user, duration=next_duration, ban_message=ban_message, note=mod_note)
+
+        await add_escalating_ban_note(subreddit, user.name, next_duration, link, mod_name)
+        print(f"Applied escalating ban: FH-Ban-{ban_duration_number} to user {user.name}") if debugmode or verbosemode else None
+    except Exception as e:
+        await error_handler(f"Error applying escalating ban to user {user.name}: {str(e)}", notify_discord=True)
+        print(f"Debug: Exception in apply_escalating_ban: {str(e)}") if debugmode or verbosemode else None
+        print(f"Debug: Exception traceback: {traceback.format_exc()}") if debugmode or verbosemode else None
+
+
+
+
+
+
+
+
+
+
+
+async def handle_approve_action(post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname):
+    #if not is_action_completed(submission_id, 'approve') and 'approve' in flair_details and flair_details['approve']:
+    try:
+        if not hasattr(post, '_fetched') or not post._fetched:
+            await post.load()
+
+        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - Approve triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+        if post.removed:
+            await post.mod.approve()
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - Submission approved on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+        else:
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - Submission already approved on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+        if post.locked:
+            await post.mod.unlock()
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - Submission unlocked on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+        if post.spoiler:
+            await post.mod.unspoiler()
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - Spoiler removed on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+        mark_action_as_completed(submission_id, 'approve')
+    except Exception as e:
+        await error_handler(f"Error in handle_approve_action for {disp_submission_id}: {str(e)}", notify_discord=True)
+
+
+async def handle_remove_action(post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname):
+    #if not is_action_completed(submission_id, 'remove') and 'remove' in flair_details and flair_details['remove']:
+    try:
+        if not hasattr(post, '_fetched') or not post._fetched:
+            await post.load()
+
+        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - remove triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+
+        if post.removed:
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Post {disp_submission_id} is already removed. Marking action as completed.") if debugmode else None
+            mark_action_as_completed(submission_id, 'remove')
+            mark_action_as_completed(submission_id, 'modlogReason')
+        else:
+            mod_note = flair_details['usernote']['note'][:100] if 'usernote' in flair_details and flair_details['usernote']['enabled'] else ''
+
+            if flair_details.get('modlogReason'):
+                mod_note = flair_details['modlogReason'][:100]  # Truncate to 100 characters
+
+            await post.mod.remove(spam=False, mod_note=mod_note)
+            mark_action_as_completed(submission_id, 'remove')
+            mark_action_as_completed(submission_id, 'modlogReason')
+    except Exception as e:
+        await error_handler(f"Error in handle_remove_action for {disp_submission_id}: {str(e)}", notify_discord=True)
+
+
+async def handle_modlog_reason_action(post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname):
+    try:
+        if not hasattr(post, '_fetched') or not post._fetched:
+            await post.load()
+
+        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - modlogReason triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+
+        mod_note = flair_details.get('modlogReason', '')[:250]  # Truncate to 250 characters
+
+        if mod_note:
+            await post.mod.create_note(note=mod_note)
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - Added mod note: '{mod_note}' to ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+        else:
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - No mod note provided for ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+
+        mark_action_as_completed(submission_id, 'modlogReason')
+    except Exception as e:
+        await error_handler(f"Error in handle_modlog_reason_action for {disp_submission_id}: {str(e)}", notify_discord=True)
+
+
+async def handle_lock_action(post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname):
+    #if not is_action_completed(submission_id, 'lock') and 'lock' in flair_details and flair_details['lock']:
+    try:
+        if not hasattr(post, '_fetched') or not post._fetched:
+            await post.load()
+
+        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - lock triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+        if not post.locked:
+            await post.mod.lock()
+            mark_action_as_completed(submission_id, 'lock')
+        else:
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Post {disp_submission_id} is already locked. Marking action as completed.") if debugmode else None
+            mark_action_as_completed(submission_id, 'lock')
+    except Exception as e:
+        await error_handler(f"Error in handle_lock_action for {disp_submission_id}: {str(e)}", notify_discord=True)
+
+
+async def handle_spoiler_action(post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname):
+    #if not is_action_completed(submission_id, 'spoiler') and 'spoiler' in flair_details and flair_details['spoiler']:
+    try:
+        if not hasattr(post, '_fetched') or not post._fetched:
+            await post.load()
+
+        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - spoiler triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+        if not post.spoiler:
+            await post.mod.spoiler()
+            mark_action_as_completed(submission_id, 'spoiler')
+        else:
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Post {disp_submission_id} is already spoilered. Marking action as completed.") if debugmode else None
+            mark_action_as_completed(submission_id, 'spoiler')
+    except Exception as e:
+        await error_handler(f"Error in handle_spoiler_action for {disp_submission_id}: {str(e)}", notify_discord=True)
+
+
+async def handle_clear_post_flair_action(post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname):
+    #if not is_action_completed(submission_id, 'clearPostFlair') and 'clearPostFlair' in flair_details and flair_details['clearPostFlair']:
+    try:
+        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - remove_link_flair triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+        await post.mod.flair(text='', css_class='')
+        mark_action_as_completed(submission_id, 'clearPostFlair')
+    except Exception as e:
+        await error_handler(f"Error in handle_clear_post_flair_action for {disp_submission_id}: {str(e)}", notify_discord=True)
+
+
+async def handle_webhook_action(config, post, flair_text, mod_name, flair_guid, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname):
+    #if not is_action_completed(submission_id, 'sendToWebhook') and 'sendToWebhook' in flair_details and flair_details['sendToWebhook']:
+    try:
+        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - send_to_webhook triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+        send_webhook_notification(config, post, flair_text, mod_name, flair_guid)
+        mark_action_as_completed(submission_id, 'sendToWebhook')
+    except Exception as e:
+        await error_handler(f"Error in handle_webhook_action for {disp_submission_id}: {str(e)}", notify_discord=True)
+
+
+async def handle_comment_action(post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname, config, formatted_removal_reason_comment):
+    #if not is_action_completed(submission_id, 'comment') and 'comment' in flair_details and flair_details['comment']['enabled']:
+    try:
+        post_age_days = (datetime.utcnow() - datetime.utcfromtimestamp(post.created_utc)).days
+        max_age = config[0]['GeneralConfiguration'].get('maxAgeForComment', 175)
+        if post_age_days <= max_age:
+            comment_body = flair_details['comment'].get('body', '')
+            if comment_body.strip():
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - comment triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+                if flair_details['remove']:
+                    removal_type = config[0]['GeneralConfiguration'].get('removal_comment_type', '')
+                    if removal_type == '':
+                        removal_type = 'public_as_subreddit'
+                    elif removal_type not in ['public', 'private', 'private_exposed', 'public_as_subreddit']:
+                        removal_type = 'public_as_subreddit'
+                    await post.mod.send_removal_message(message=formatted_removal_reason_comment, type=removal_type)
+                else:
+                    comment = await post.reply(formatted_removal_reason_comment)
+                    if flair_details['comment']['stickyComment']:
+                        await comment.mod.distinguish(sticky=True)
+                    if flair_details['comment']['lockComment']:
+                        await comment.mod.lock()
+                mark_action_as_completed(submission_id, 'comment')
+            else:
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Skipping comment action due to empty comment body on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+                mark_action_as_completed(submission_id, 'comment')
+        else:
+            mark_action_as_completed(submission_id, 'comment')
+    except Exception as e:
+        await error_handler(f"Error in handle_comment_action for {disp_submission_id}: {str(e)}", notify_discord=True)
+
+
+async def handle_ban_action(subreddit, post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname, placeholders, mod_name):
+    #if not is_action_completed(submission_id, 'ban') and 'ban' in flair_details and flair_details['ban']['enabled']:
+    try:
+        ban_duration = flair_details['ban'].get('duration', '')
+        ban_message = flair_details['ban']['message']
+        ban_reason = flair_details['ban']['modNote']
+
+        for placeholder, value in placeholders.items():
+            ban_message = ban_message.replace(f"{{{{{placeholder}}}}}", str(value))
+            ban_reason = ban_reason.replace(f"{{{{{placeholder}}}}}", str(value))[:100]
+
+        if isinstance(ban_duration, str) and ',' in ban_duration:
+            duration_list = parse_ban_duration_list(ban_duration)
+            await apply_escalating_ban(subreddit, post.author, duration_list, ban_message, ban_reason, mod_name, post.permalink)
+        else:
+            if ban_duration == '' or ban_duration is True:
+                await subreddit.banned.add(post.author, ban_message=ban_message, ban_reason=ban_reason)
+            elif isinstance(ban_duration, int) and ban_duration > 0:
+                await subreddit.banned.add(post.author, ban_message=ban_message, ban_reason=ban_reason, duration=ban_duration)
+            else:
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Skipping ban action due to invalid ban duration on ID: {disp_submission_id} for flair GUID: {flair_details['templateId']} in {disp_subreddit_displayname}") if debugmode else None
+                return
+        mark_action_as_completed(submission_id, 'ban')
+    except Exception as e:
+        await error_handler(f"Error in handle_ban_action for {disp_submission_id}: {str(e)}", notify_discord=True)
+
+
+async def handle_unban_action(subreddit, post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname):
+    #if not is_action_completed(submission_id, 'unban') and 'unban' in flair_details and flair_details['unban']:
+    try:
+        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - unban triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+        await subreddit.banned.remove(post.author)
+        mark_action_as_completed(submission_id, 'unban')
+    except Exception as e:
+        await error_handler(f"Error in handle_unban_action for {disp_submission_id}: {str(e)}", notify_discord=True)
+
+
+async def handle_user_flair_action(subreddit, post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname, placeholders):
+    #if not is_action_completed(submission_id, 'userFlair') and 'userFlair' in flair_details and flair_details['userFlair']['enabled']:
+    try:
+        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - set_author_flair triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+
+        flair_text = flair_details['userFlair'].get('text', '')
+        flair_css_class = flair_details['userFlair'].get('cssClass', '')
+        flair_template_id = flair_details['userFlair'].get('templateId', '') or flair_details['userFlair'].get('templateID', '')
+
+        for placeholder, value in placeholders.items():
+            flair_text = flair_text.replace(f"{{{{{placeholder}}}}}", str(value))
+            flair_css_class = flair_css_class.replace(f"{{{{{placeholder}}}}}", str(value))
+
+        try:
+            if flair_template_id:
+                await subreddit.flair.set(post.author, flair_template_id=flair_template_id)
+            elif flair_text or flair_css_class:
+                await subreddit.flair.set(post.author, text=flair_text, css_class=flair_css_class)
+            mark_action_as_completed(submission_id, 'userFlair')
+        except Exception as e:
+            await error_handler(f"Error setting user flair for {post.author} in {subreddit.display_name}: {str(e)}", notify_discord=True)
+    except Exception as e:
+        await error_handler(f"Error in handle_user_flair_action for {disp_submission_id}: {str(e)}", notify_discord=True)
+
+
+async def handle_usernote_action(subreddit, post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname, placeholders, config, mod_name):
+    #if not is_action_completed(submission_id, 'usernote') and 'usernote' in flair_details and flair_details['usernote']['enabled']:
+    try:
+        usernote_note = flair_details['usernote'].get('note', '')
+        if usernote_note.strip():
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - usernote triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+            author = post.author.name
+            note_text = flair_details['usernote']['note']
+            for placeholder, value in placeholders.items():
+                note_text = note_text.replace(f"{{{{{placeholder}}}}}", str(value))
+            link = post.permalink
+            usernote_type_name = config[0]['GeneralConfiguration'].get('usernote_type_name', None)
+            await update_usernotes(subreddit, author, note_text, link, mod_name, usernote_type_name)
+            mark_action_as_completed(submission_id, 'usernote')
+        else:
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Skipping usernote action due to empty usernote note on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+            mark_action_as_completed(submission_id, 'usernote')
+    except Exception as e:
+        await error_handler(f"Error in handle_usernote_action for {disp_submission_id}: {str(e)}", notify_discord=True)
+
+
+async def handle_contributor_action(subreddit, post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname):
+    #if not is_action_completed(submission_id, 'contributor') and 'contributor' in flair_details and flair_details['contributor']['enabled']:
+    try:
+        if flair_details['contributor']['action'] == 'add':
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - add_contributor triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+            await subreddit.contributor.add(post.author)
+        elif flair_details['contributor']['action'] == 'remove':
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - remove_contributor triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+            await subreddit.contributor.remove(post.author)
+        mark_action_as_completed(submission_id, 'contributor')
+    except Exception as e:
+        await error_handler(f"Error in handle_contributor_action for {disp_submission_id}: {str(e)}", notify_discord=True)
+
+
+async def handle_nuke_action(reddit, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname, post):
+    #if not is_action_completed(submission_id, 'nuke') and 'nuke' in flair_details and flair_details['nuke'].get('enabled', False):
+    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - [NUKE] Nuke action invoked under Post ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+
+    nuke_config = flair_details['nuke']
+    ban = nuke_config.get('banFromAllListed', True)
+    remove_comments = nuke_config.get('removeAllComments', True)
+    remove_submissions = nuke_config.get('removeAllSubmissions', True)
+    subreddits = nuke_config.get('targetSubreddits', [])
+
+    user = post.author
+
+    try:
+        for subreddit_name in subreddits:
+            try:
+                subreddit = await reddit.subreddit(subreddit_name)
+
+                if ban:
+                    await subreddit.banned.add(user, ban_reason="Nuke action performed")
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - [NUKE] Banned user {user} from {subreddit_name}") if debugmode else None
+
+                if remove_comments:
+                    async for comment in user.comments.new(limit=None):
+                        if comment.subreddit == subreddit_name and not comment.removed:
+                            await comment.mod.remove()
+                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - [NUKE] Removed comment {comment.id} from {subreddit_name}") if debugmode else None
+
+                if remove_submissions:
+                    async for submission in user.submissions.new(limit=None):
+                        if submission.subreddit == subreddit_name and not submission.removed:
+                            await submission.mod.remove()
+                            await submission.mod.lock()
+                            await submission.mod.spoiler()
+                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - [NUKE] Removed submission {submission.id} from {subreddit_name}") if debugmode else None
+
+            except Exception as e:
+                await error_handler(f"Error performing nuke action in {subreddit_name}: {str(e)}", notify_discord=True)
+
+        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - [NUKE] Nuke action completed for user {user} across specified subreddits {subreddits}.") if debugmode else None
+
+    except Exception as e:
+        await error_handler(f"Error in nuke process for user {user}: {str(e)}", notify_discord=True)
+    finally:
+        mark_action_as_completed(submission_id, 'nuke')
+
+
+async def handle_nuke_user_comments_action(post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname):
+    #if not is_action_completed(submission_id, 'nukeUserComments') and flair_details.get('nukeUserComments', False):
+    try:
+        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - nuking comments under Post ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+
+        submission_comments = post.comments
+
+        async for comment in submission_comments:
+            if not comment.removed and comment.distinguished != 'moderator':
+                await comment.mod.remove()
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - removed comment {comment.id} under Post ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+
+        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - finished nuking comments under Post ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+        mark_action_as_completed(submission_id, 'nukeUserComments')
+    except Exception as e:
+        await error_handler(f"Error in handle_nuke_user_comments_action for {disp_submission_id}: {str(e)}", notify_discord=True)
+
+
+
+
+# Primary process to handle any flair changes that appear in the logs
+async def process_flair_assignment(reddit, post, config, subreddit, mod_name, max_retries=3, retry_delay=5):
+    submission_id = post.id
+    flair_guid = getattr(post, 'link_flair_template_id', None)
     flair_details = next((flair for flair in config[1:] if flair['templateId'] == flair_guid), None)
+
+    # Initialize variables
+    post_author_name = "[deleted]"
+    is_author_deleted = True
+    is_author_suspended = False
+    author_id = None
+    subreddit_id = None
 
     if colored_console_output:
         disp_subreddit_displayname = colored("/r/"+subreddit.display_name, "cyan", attrs=["underline"])
-        disp_submission_id = colored(post.id, "yellow")
+        disp_submission_id = colored(submission_id, "yellow")
         disp_flair_guid = colored(flair_guid, "magenta")
     else:
         disp_subreddit_displayname = subreddit.display_name
-        disp_submission_id = post.id
+        disp_submission_id = submission_id
         disp_flair_guid = flair_guid
 
     if flair_details is None:
         print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair GUID {disp_flair_guid} not found in the configuration for {disp_subreddit_displayname}") if debugmode else None
         return
 
-    submission_id = post.id
-
-    # Get the post title and author for debugging
-    post_author_name = post.author.name if post.author else "[deleted]"
-    # boolean variable to track whether the author is deleted or suspended:
-    is_author_deleted_or_suspended = post_author_name == "[deleted]"
-
     # Reload the configuration from the database
     config = get_cached_config(subreddit.display_name)
-
 
     if config is None:
         print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Configuration not found for {disp_subreddit_displayname}. Skipping flair assignment.")
         return
 
     if flair_guid and any(flair['templateId'] == flair_guid for flair in config[1:]):
-        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair GUID {disp_flair_guid} detected on ID: {disp_submission_id} on post '{post.title}' by {post_author_name} in {disp_subreddit_displayname}") if debugmode else None
-
-        # Get the "notes" field for the current flair GUID
-        flair_notes = next((flair['notes'] for flair in config[1:] if flair['templateId'] == flair_guid), None)
-        if flair_notes:
-            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: || Flair Notes || {flair_notes}") if debugmode else None
-        #else:
-        #    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: No flair notes found for GUID {disp_flair_guid}") if debugmode else None
-
-
-        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair details: {flair_details}") if verbosemode else None
+        user_info = ""
+        author_details = ""
 
         try:
             await post.load()
-            # Now that post data is loaded, ensure that author data is loaded
+
+            if post.author is None:
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: No author found for post ID: {disp_submission_id}. Post is likely deleted.") if debugmode else None
+                # Mark all actions as completed for deleted posts
+
+                await handle_remove_action(post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname)
+                await handle_lock_action(post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname)
+
+                # Mark other actions as completed
+                #actions_to_complete = ['comment', 'approve', 'remove', 'lock', 'modlogReason', 'ban', 'unban', 'userFlair', 'usernote', 'contributor', 'sendToWebhook']
+                actions_to_complete = ['comment', 'approve', 'modlogReason', 'ban', 'unban', 'userFlair', 'usernote', 'contributor', 'sendToWebhook']
+                #for action in actions_to_complete:
+                #    mark_action_as_completed(submission_id, action)
+                #    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Marked action '{action}' as completed for deleted post {disp_submission_id}") if debugmode else None
+
+                for action in actions_to_complete:
+                    if action in flair_details:
+                        should_mark_completed = False
+                        if action == 'comment':
+                            should_mark_completed = flair_details[action].get('enabled', False)
+                        elif action in ['userFlair', 'ban']:
+                            should_mark_completed = flair_details[action].get('enabled', False)
+                        else:
+                            should_mark_completed = bool(flair_details[action])
+
+                        if should_mark_completed:
+                            mark_action_as_completed(submission_id, action)
+                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Marked action '{action}' as completed for deleted post {disp_submission_id}") if debugmode else None
+
+                # Delete all actions for this submission from the database
+                delete_completed_actions(submission_id)
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Deleted all actions for deleted post {disp_submission_id} from database") if debugmode else None
+                return  # Exit the function early for deleted posts
+
+            # Load subreddit data
+            try:
+                await subreddit.load()
+                subreddit_id = subreddit.id
+            except AttributeError:
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Unable to fetch subreddit ID for {subreddit.display_name}") if debugmode else None
+
+            disp_author_name = get_display_name(post.author, colored_console_output)
+
             if post.author:
+                is_author_deleted = False
+                post_author_name = post.author.name
                 await post.author.load()
-                if hasattr(post.author, 'is_suspended') and post.author.is_suspended:
-                    author_id = None
-                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Skipping author ID on ID: {disp_submission_id} for suspended user: {post.author.name}") if debugmode else None
+                is_author_suspended = hasattr(post.author, 'is_suspended') and post.author.is_suspended
+                author_id = None if is_author_suspended else getattr(post.author, 'id', None)
+
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Author Info: Username: {post_author_name}, Is deleted: {is_author_deleted}, Is suspended: {is_author_suspended}, Author ID: {author_id}") if debugmode else None
+
+                if not (is_author_deleted or is_author_suspended):
+                    try:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Account created: {datetime.fromtimestamp(post.author.created_utc)}, Comment Karma: {post.author.comment_karma}, Link Karma: {post.author.link_karma}") if verbosemode else None
+                    except AttributeError:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Some account attributes not available") if verbosemode else None
+
+                    # Additional check: try to fetch a recent comment
+                    try:
+                        async for comment in post.author.comments.new(limit=1):
+                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Latest comment timestamp: {datetime.fromtimestamp(comment.created_utc)}") if verbosemode else None
+                            break
+                    except Exception as e:
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error fetching recent comment: {str(e)}") if verbosemode else None
                 else:
-                    author_id = post.author.id
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Note: Most attributes are not available for deleted or suspended accounts.") if debugmode else None
             else:
-                # Handle the case where the post may not have an author (e.g., deleted account)
-                author_id = None
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: No author found for post ID: {disp_submission_id}") if debugmode else None
 
-            if post.subreddit:
-                await post.subreddit.load()
-                subreddit_id = post.subreddit.id
-            else:
-                # Handle the case where the post may not have an author (e.g., deleted account)
-                subreddit_id = None
-
-            # Only fetch the current flair if the author is not deleted or suspended
-            if not is_author_deleted_or_suspended:
-                current_flair = await fetch_user_flair(subreddit, post.author.name)  # Fetch the current flair asynchronously
-            else:
-                current_flair = None
-
-            print(f"User Info... \nis_author_deleted_or_suspended: {is_author_deleted_or_suspended}\npost.author: {post.author}\nauthor_id: {author_id}") if verbosemode else None
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair GUID {disp_flair_guid} detected on ID: {disp_submission_id} on post '{post.title}' by {disp_author_name} in {disp_subreddit_displayname}") if debugmode else None
 
         except (asyncprawcore.exceptions.NotFound, asyncprawcore.exceptions.Forbidden) as e:
-            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error loading post or author data for ID: {disp_submission_id}. Post may be removed or author may be shadowbanned/deleted. Skipping flair assignment.") if debugmode else None
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Exception {type(e).__name__}: Error loading post or author data for ID: {disp_submission_id}. Post may be removed or author may be shadowbanned/deleted. Error details: {str(e)}") if debugmode else None
+
+            await handle_remove_action(post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname)
+            await handle_lock_action(post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname)
+
+            #actions_to_complete = ['comment', 'approve', 'remove', 'lock', 'modlogReason', 'ban', 'unban', 'userFlair', 'usernote', 'contributor', 'sendToWebhook']
+            actions_to_complete = ['comment', 'approve', 'modlogReason', 'ban', 'unban', 'userFlair', 'usernote', 'contributor', 'sendToWebhook']
+            #for action in actions_to_complete:
+            #    mark_action_as_completed(submission_id, action)
+            #    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Marked action '{action}' as completed for submission {disp_submission_id}") if debugmode else None
+            for action in actions_to_complete:
+                if action in flair_details:
+                    should_mark_completed = False
+                    if action == 'comment':
+                        should_mark_completed = flair_details[action].get('enabled', False)
+                    elif action in ['userFlair', 'ban']:
+                        should_mark_completed = flair_details[action].get('enabled', False)
+                    else:
+                        should_mark_completed = bool(flair_details[action])
+
+                    if should_mark_completed:
+                        mark_action_as_completed(submission_id, action)
+                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Marked action '{action}' as completed for deleted post {disp_submission_id}") if debugmode else None
+
+            # Delete all actions for this submission from the database
+            delete_completed_actions(submission_id)
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Deleted all actions for problematic post {disp_submission_id} from database") if debugmode else None
+            return
+
+        except Exception as e:
+            error_message = f"reddit_error_handler:\n Function: process_flair_assignment\n Unexpected Error: {str(e)}\n Traceback: {traceback.format_exc()}"
+            print(error_message) if debugmode else None
+            await error_handler(error_message, notify_discord=True)
+            return
+
+        """
+        try:
+            await post.load()
+
+            # Load subreddit data
+            try:
+                await subreddit.load()
+                subreddit_id = subreddit.id
+            except AttributeError:
+                user_info += f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Unable to fetch subreddit ID for {subreddit.display_name}\n" if debugmode else ""
+
+            disp_author_name = get_display_name(post.author, colored_console_output)
+
+            if post.author:
+                is_author_deleted = False
+                post_author_name = post.author.name
+                await post.author.load()
+                is_author_suspended = hasattr(post.author, 'is_suspended') and post.author.is_suspended
+                author_id = None if is_author_suspended else getattr(post.author, 'id', None)
+
+                author_details += f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Author Info:\n"
+                author_details += f"                         Username: {post_author_name}  |  Is deleted: {is_author_deleted}  |  Is suspended: {is_author_suspended}  |  Author ID: {author_id}\n"
+
+                if not (is_author_deleted or is_author_suspended):
+                    try:
+                        author_details += f"                         Account created: {datetime.fromtimestamp(post.author.created_utc)}  |  Comment Karma: {post.author.comment_karma}  |  Link Karma: {post.author.link_karma}\n" if verbosemode else ""
+                    except AttributeError:
+                        author_details += "                         Some account attributes not available\n" if verbosemode else ""
+
+                    # Additional check: try to fetch a recent comment
+                    try:
+                        async for comment in post.author.comments.new(limit=1):
+                            author_details += f"                         Latest comment timestamp: {datetime.fromtimestamp(comment.created_utc)}\n" if verbosemode else ""
+                            break
+                    except Exception as e:
+                        author_details += f"                         Error fetching recent comment: {str(e)}\n" if verbosemode else ""
+                else:
+                    author_details += "                         Note: Most attributes are not available for deleted or suspended accounts.\n" if debugmode else ""
+            else:
+                user_info += f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: No author found for post ID: {disp_submission_id}\n" if debugmode else ""
+
+            # Now print all the collected information
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair GUID {disp_flair_guid} detected on ID: {disp_submission_id} on post '{post.title}' by {disp_author_name} in {disp_subreddit_displayname}") if debugmode else None
+
+
+        except (asyncprawcore.exceptions.NotFound, asyncprawcore.exceptions.Forbidden) as e:
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Exception NotFound or Forbidden: Error loading post or author data for ID: {disp_submission_id}. Post may be removed or author may be shadowbanned/deleted. Skipping flair assignment.") if debugmode else None
             mark_action_as_completed(submission_id, 'comment')
             mark_action_as_completed(submission_id, 'approve')
             mark_action_as_completed(submission_id, 'remove')
@@ -835,13 +1592,29 @@ async def process_flair_assignment(reddit, post, config, subreddit, mod_name, ma
             await asyncio.sleep(2)
             return
 
+        except Exception as e:
+            error_message = f"reddit_error_handler:\n Function: process_flair_assignment\n Unexpected Error: {str(e)}"
+            print(error_message)
+            print(traceback.format_exc())
+            await error_handler(error_message, notify_discord=True)
+            return
+            # Handle the error appropriately
+        """
+
+        is_author_deleted_or_suspended = is_author_deleted or is_author_suspended
+
         # Initialize defaults if the user has no current flair
         flair_text = ''
         flair_css_class = ''
 
-        if current_flair:
-            flair_text = current_flair.get('flair_text', '')
-            flair_css_class = current_flair.get('flair_css_class', '')
+        if not is_author_deleted_or_suspended and post.author:
+            try:
+                current_flair = await fetch_user_flair(subreddit, post.author.name)
+                if current_flair:
+                    flair_text = current_flair.get('flair_text', '')
+                    flair_css_class = current_flair.get('flair_css_class', '')
+            except Exception as e:
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error fetching current flair: {str(e)}") if debugmode else None
 
         # Format the header, flair details, and footer with the placeholders
         formatted_header = config[0]['GeneralConfiguration']['header']
@@ -893,8 +1666,8 @@ async def process_flair_assignment(reddit, post, config, subreddit, mod_name, ma
             'link_flair_text': post.link_flair_text if post.link_flair_text else '',
             'link_flair_css_class': post.link_flair_css_class if post.link_flair_css_class else '',
             'link_flair_template_id': post.link_flair_template_id if post.link_flair_template_id else '',
-            'author_id': author_id,
-            'subreddit_id': post.subreddit.id
+            'author_id': author_id if author_id is not None else '[deleted]',
+            'subreddit_id': subreddit_id if subreddit_id else '[unavailable]'
         })
 
         for placeholder, value in placeholders.items():
@@ -908,284 +1681,78 @@ async def process_flair_assignment(reddit, post, config, subreddit, mod_name, ma
         formatted_removal_reason_comment = f"{formatted_header}\n\n{formatted_flair_removal_details}\n\n{formatted_footer}"
 
         # Execute the configured actions
-        if not is_action_completed(submission_id, 'approve') and 'approve' in flair_details and flair_details['approve']:
-            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - Approve triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
 
-            await post.load()
+        try:
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Beginning action processing for submission {disp_submission_id}") if debugmode else None
 
-            if post.removed:
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - Submission approved on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
-                await post.mod.approve()
-            else:
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - Submission already approved on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+            # Handle each action
+            if not is_action_completed(submission_id, 'approve') and 'approve' in flair_details and flair_details['approve']:
+                await handle_approve_action(post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname)
 
-            if post.locked:
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - Submission unlocked on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
-                await post.mod.unlock()
-            else:
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - Submission already unlocked on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+            if not is_action_completed(submission_id, 'remove') and 'remove' in flair_details and flair_details['remove']:
+                await handle_remove_action(post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname)
 
-            if post.spoiler:
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - Spoiler removed on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
-                await post.mod.unspoiler()
-            else:
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - Submission not spoilered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+            if not flair_details.get('remove') and not is_action_completed(submission_id, 'modlogReason') and flair_details.get('modlogReason'):
+                await handle_modlog_reason_action(post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname)
 
-            mark_action_as_completed(submission_id, 'approve')
+            if not is_action_completed(submission_id, 'lock') and 'lock' in flair_details and flair_details['lock']:
+                await handle_lock_action(post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname)
 
-        if not is_action_completed(submission_id, 'remove') and 'remove' in flair_details and flair_details['remove']:
-            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - remove triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+            if not is_action_completed(submission_id, 'spoiler') and 'spoiler' in flair_details and flair_details['spoiler']:
+                await handle_spoiler_action(post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname)
 
-            if post.removed:
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Post {disp_submission_id} is already removed. Marking action as completed.") if debugmode else None
-                mark_action_as_completed(submission_id, 'remove')
-                mark_action_as_completed(submission_id, 'modlogReason')
-            else:
-                mod_note = flair_details['usernote']['note'][:100] if 'usernote' in flair_details and flair_details['usernote']['enabled'] else ''
+            if not is_action_completed(submission_id, 'clearPostFlair') and 'clearPostFlair' in flair_details and flair_details['clearPostFlair']:
+                await handle_clear_post_flair_action(post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname)
 
-                if flair_details.get('modlogReason'):
-                    mod_note = flair_details['modlogReason'][:100]  # Truncate to 100 characters
+            if not is_action_completed(submission_id, 'sendToWebhook') and 'sendToWebhook' in flair_details and flair_details['sendToWebhook']:
+                await handle_webhook_action(config, post, flair_text, mod_name, flair_guid, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname)
 
-                await post.mod.remove(spam=False, mod_note=mod_note)
-                mark_action_as_completed(submission_id, 'remove')
-                mark_action_as_completed(submission_id, 'modlogReason')
+            if not (is_author_deleted or is_author_suspended):
+                if not is_action_completed(submission_id, 'comment') and 'comment' in flair_details and flair_details['comment']['enabled']:
+                    await handle_comment_action(post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname, config, formatted_removal_reason_comment)
 
-        if not flair_details.get('remove') and not is_action_completed(submission_id, 'modlogReason') and flair_details.get('modlogReason'):
-            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - modlogReason triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
-            await post.mod.create_note(note=flair_details['modlogReason'][:250])  # Truncate to 250 characters
-            mark_action_as_completed(submission_id, 'modlogReason')
+                if not is_action_completed(submission_id, 'ban') and 'ban' in flair_details and flair_details['ban']['enabled']:
+                    await handle_ban_action(subreddit, post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname, placeholders, mod_name)
 
-        if not is_action_completed(submission_id, 'lock') and 'lock' in flair_details and flair_details['lock']:
-            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - lock triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+                if not is_action_completed(submission_id, 'unban') and 'unban' in flair_details and flair_details['unban']:
+                    await handle_unban_action(subreddit, post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname)
 
-            if post.locked:
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Post {disp_submission_id} is already locked. Marking action as completed.") if debugmode else None
-                mark_action_as_completed(submission_id, 'lock')
-            else:
-                await post.mod.lock()
-                mark_action_as_completed(submission_id, 'lock')
+                if not is_action_completed(submission_id, 'userFlair') and 'userFlair' in flair_details and flair_details['userFlair']['enabled']:
+                    await handle_user_flair_action(subreddit, post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname, placeholders)
 
-        if not is_action_completed(submission_id, 'spoiler') and 'spoiler' in flair_details and flair_details['spoiler']:
-            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - spoiler triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+                if not is_action_completed(submission_id, 'usernote') and 'usernote' in flair_details and flair_details['usernote']['enabled']:
+                    await handle_usernote_action(subreddit, post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname, placeholders, config, mod_name)
 
-            if post.spoiler:
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Post {disp_submission_id} is already spoilered. Marking action as completed.") if debugmode else None
-                mark_action_as_completed(submission_id, 'spoiler')
-            else:
-                await post.mod.spoiler()
-                mark_action_as_completed(submission_id, 'spoiler')
+                if not is_action_completed(submission_id, 'contributor') and 'contributor' in flair_details and flair_details['contributor']['enabled']:
+                    await handle_contributor_action(subreddit, post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname)
 
-        if not is_action_completed(submission_id, 'clearPostFlair') and 'clearPostFlair' in flair_details and flair_details['clearPostFlair']:
-            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - remove_link_flair triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
-            await post.mod.flair(text='', css_class='')
-            mark_action_as_completed(submission_id, 'clearPostFlair')
-
-        if not is_action_completed(submission_id, 'sendToWebhook') and 'sendToWebhook' in flair_details and flair_details['sendToWebhook']:
-            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - send_to_webhook triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
-            # Send webhook notification
-            send_webhook_notification(config, post, flair_text, mod_name, flair_guid)
-            mark_action_as_completed(submission_id, 'sendToWebhook')
-
-
-        # Only process the below if not suspended or deleted
-        if not is_author_deleted_or_suspended:
-
-            if not is_action_completed(submission_id, 'comment') and 'comment' in flair_details and flair_details['comment']['enabled']:
-                post_age_days = (datetime.utcnow() - datetime.utcfromtimestamp(post.created_utc)).days
-                max_age = config[0]['GeneralConfiguration'].get('maxAgeForComment', 175)
-                if post_age_days <= max_age:
-                    comment_body = flair_details['comment'].get('body', '')
-                    if comment_body.strip():
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - comment triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
-                        if flair_details['remove']:
-                            # If both 'remove' and 'comment' are configured for the flair GUID
-                            removal_type = config[0]['GeneralConfiguration'].get('removal_comment_type', '')
-                            if removal_type == '':
-                                removal_type = 'public_as_subreddit'  # Default to 'public' if removal_comment_type is blank or unset
-                            elif removal_type not in ['public', 'private', 'private_exposed', 'public_as_subreddit']:
-                                removal_type = 'public_as_subreddit'  # Use 'public' as the default if an invalid value is provided
-                            await post.mod.send_removal_message(message=formatted_removal_reason_comment, type=removal_type)
-                        else:
-                            # If only 'comment' is configured for the flair GUID
-                            comment = await post.reply(formatted_removal_reason_comment)
-                            if flair_details['comment']['stickyComment']:
-                                await comment.mod.distinguish(sticky=True)
-                            if flair_details['comment']['lockComment']:
-                                await comment.mod.lock()
-                        mark_action_as_completed(submission_id, 'comment')
+                if not is_action_completed(submission_id, 'nuke') and 'nuke' in flair_details and flair_details['nuke'].get('enabled', False):
+                    if allow_ban_and_nuke:
+                        await handle_nuke_action(reddit, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname, post)
                     else:
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Skipping comment action due to empty comment body on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
-                        mark_action_as_completed(submission_id, 'comment')
-                else:
-                    # Submission over age, mark as completed.
-                    mark_action_as_completed(submission_id, 'comment')
+                        mark_action_as_completed(submission_id, 'nuke')
 
-            # Check if banning is configured for the flair GUID
-            if not is_action_completed(submission_id, 'ban') and 'ban' in flair_details and flair_details['ban']['enabled']:
-                ban_duration = flair_details['ban'].get('duration', '')
-                ban_message = flair_details['ban']['message']
-                ban_reason = flair_details['ban']['modNote']
-
-                if ban_message:
-                    for placeholder, value in placeholders.items():
-                        ban_message = ban_message.replace(f"{{{{{placeholder}}}}}", str(value))
-
-                if ban_reason:
-                    for placeholder, value in placeholders.items():
-                        ban_reason = ban_reason.replace(f"{{{{{placeholder}}}}}", str(value))[:100]
-
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Debugging: ban_duration={ban_duration}, ban_message={ban_message}, ban_reason={ban_reason}") if debugmode else None
-                if ban_duration == '' or ban_duration is True:
-                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - permanent ban triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
-                    await subreddit.banned.add(post.author, ban_message=ban_message, ban_reason=ban_reason)
-                    mark_action_as_completed(submission_id, 'ban')
-                elif isinstance(ban_duration, int) and ban_duration > 0:
-                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - temporary ban triggered on ID: {disp_submission_id} for {ban_duration} days in {disp_subreddit_displayname}") if debugmode else None
-                    await subreddit.banned.add(post.author, ban_message=ban_message, ban_reason=ban_reason, duration=ban_duration)
-                    mark_action_as_completed(submission_id, 'ban')
-                else:
-                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Skipping ban action due to invalid ban duration on ID: {disp_submission_id} for flair GUID: {flair_details['templateId']} in {disp_subreddit_displayname}") if debugmode else None
-                    try:
-                        subreddit_instance = await get_subreddit(reddit, subreddit.display_name)
-                        await subreddit.message(
-                            subject="Invalid Configuration",
-                            message=f"The Ban Action for [this submission](https://redd.it/{post.id}) under /r/{subreddit.display_name} was not applied for user /u/{post.author} due to an invalid ban duration in your configuration.\n\nYou may wish to review your settings for for flair GUID: {flair_details['templateId']} in your [flair_helper wiki page](https://www.reddit.com/r/{subreddit.display_name}/wiki/edit/flair_helper)\n\nYou may also want to manually ban the user: [Ban ](https://www.reddit.com/r/{subreddit.display_name}/about/banned/?user={post.author}) since this action may not have been completed automatically due to the configuration error."
-                        )
-                    except asyncpraw.exceptions.RedditAPIException as e:
-                        await error_handler(f"Error sending message to {subreddit.display_name}: {e}", notify_discord=True)
-                    mark_action_as_completed(submission_id, 'ban')
-
-            if not is_action_completed(submission_id, 'unban') and 'unban' in flair_details and flair_details['unban']:
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - unban triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
-                await subreddit.banned.remove(post.author)
+            else:
+                #User Suspended or Deleted, Mark actions as complete
+                mark_action_as_completed(submission_id, 'comment')
+                mark_action_as_completed(submission_id, 'ban')
                 mark_action_as_completed(submission_id, 'unban')
-
-            if not is_action_completed(submission_id, 'userFlair') and 'userFlair' in flair_details and flair_details['userFlair']['enabled']:
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - set_author_flair triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
-
-                flair_text = flair_details['userFlair'].get('text', '')
-                flair_css_class = flair_details['userFlair'].get('cssClass', '')
-                flair_template_id = flair_details['userFlair'].get('templateId', '') or flair_details['userFlair'].get('templateID', '')
-
-                # Replace placeholders in flair text and CSS class
-                for placeholder, value in placeholders.items():
-                    flair_text = flair_text.replace(f"{{{{{placeholder}}}}}", str(value))
-                    flair_css_class = flair_css_class.replace(f"{{{{{placeholder}}}}}", str(value))
-
-                try:
-                    if flair_template_id:
-                        # If template ID is provided, use it (this takes precedence)
-                        await subreddit.flair.set(post.author, flair_template_id=flair_template_id)
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - Set user flair template ID to: '{flair_template_id}'") if debugmode else None
-                    elif flair_text or flair_css_class:
-                        # If no template ID but text or CSS class is provided, use them
-                        await subreddit.flair.set(post.author, text=flair_text, css_class=flair_css_class)
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - Set user flair text to: '{flair_text}', CSS class to: '{flair_css_class}'") if debugmode else None
-                    else:
-                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - No flair settings provided, skipping flair assignment") if debugmode else None
-        
-                    mark_action_as_completed(submission_id, 'userFlair')
-                except Exception as e:
-                    await error_handler(f"Error setting user flair for {post.author} in {subreddit.display_name}: {str(e)}", notify_discord=True)
-
-
-
-            if not is_action_completed(submission_id, 'usernote') and 'usernote' in flair_details and flair_details['usernote']['enabled']:
-                usernote_note = flair_details['usernote'].get('note', '')
-
-                if usernote_note.strip():
-                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - usernote triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
-                    author = post_author_name
-                    note_text = flair_details['usernote']['note']
-                    for placeholder, value in placeholders.items():
-                        note_text = note_text.replace(f"{{{{{placeholder}}}}}", str(value))
-                    link = post.permalink
-                    usernote_type_name = config[0]['GeneralConfiguration'].get('usernote_type_name', None)
-                    await update_usernotes(subreddit, author, note_text, link, mod_name, usernote_type_name)
-                    mark_action_as_completed(submission_id, 'usernote')
-                else:
-                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Skipping usernote action due to empty usernote note on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
-                    mark_action_as_completed(submission_id, 'usernote')
-
-            if not is_action_completed(submission_id, 'contributor') and 'contributor' in flair_details and flair_details['contributor']['enabled'] and flair_details['contributor']['action'] == 'add':
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - add_contributor triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
-                await subreddit.contributor.add(post.author)
+                mark_action_as_completed(submission_id, 'userFlair')
+                mark_action_as_completed(submission_id, 'usernote')
                 mark_action_as_completed(submission_id, 'contributor')
-
-            if not is_action_completed(submission_id, 'contributor') and 'contributor' in flair_details and flair_details['contributor']['enabled'] and flair_details['contributor']['action'] == 'remove':
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - remove_contributor triggered on ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
-                await subreddit.contributor.remove(post.author)
-                mark_action_as_completed(submission_id, 'contributor')
-
-            if not is_action_completed(submission_id, 'nuke') and 'nuke' in flair_details and flair_details['nuke'].get('enabled', False):
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - [NUKE] Nuke action invoked under Post ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
-
-                nuke_config = flair_details['nuke']
-                ban = nuke_config.get('banFromAllListed', True)
-                remove_comments = nuke_config.get('removeAllComments', True)
-                remove_submissions = nuke_config.get('removeAllSubmissions', True)
-                subreddits = nuke_config.get('targetSubreddits', [])
-
-                user = post.author
-
-                try:
-                    for subreddit_name in subreddits:
-                        try:
-                            subreddit = await reddit.subreddit(subreddit_name)
-
-                            if ban:
-                                await subreddit.banned.add(user, ban_reason="Nuke action performed")
-                                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - [NUKE] Banned user {user} from {subreddit_name}") if debugmode else None
-
-                            if remove_comments:
-                                async for comment in user.comments.new(limit=None):
-                                    if comment.subreddit == subreddit_name and not comment.removed:
-                                        await comment.mod.remove()
-                                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - [NUKE] Removed comment {comment.id} from {subreddit_name}") if debugmode else None
-
-                            if remove_submissions:
-                                async for submission in user.submissions.new(limit=None):
-                                    if submission.subreddit == subreddit_name and not submission.removed:
-                                        await submission.mod.remove()
-                                        await submission.mod.lock()
-                                        await submission.mod.spoiler()
-                                        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - [NUKE] Removed submission {submission.id} from {subreddit_name}") if debugmode else None
-
-                        except Exception as e:
-                            await error_handler(f"Error performing nuke action in {subreddit_name}: {str(e)}", notify_discord=True)
-
-                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - [NUKE] Nuke action completed for user {user} across specified subreddits {subreddits}.") if debugmode else None
-
-                except Exception as e:
-                    await error_handler(f"Error in nuke process for user {user}: {str(e)}", notify_discord=True)
-                finally:
-                    mark_action_as_completed(submission_id, 'nuke')
-
-        else:
-            #User Suspended or Deleted, Mark actions as complete
-            mark_action_as_completed(submission_id, 'comment')
-            mark_action_as_completed(submission_id, 'ban')
-            mark_action_as_completed(submission_id, 'unban')
-            mark_action_as_completed(submission_id, 'userFlair')
-            mark_action_as_completed(submission_id, 'usernote')
-            mark_action_as_completed(submission_id, 'contributor')
-            mark_action_as_completed(submission_id, 'nuke')
+                mark_action_as_completed(submission_id, 'nuke')
 
 
+            if not is_action_completed(submission_id, 'nukeUserComments') and flair_details.get('nukeUserComments', False):
+                await handle_nuke_user_comments_action(post, submission_id, flair_details, disp_submission_id, disp_subreddit_displayname)
 
-        if not is_action_completed(submission_id, 'nukeUserComments') and flair_details.get('nukeUserComments', False):
-            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - nuking comments under Post ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
+        except Exception as e:
+            await error_handler(f"Error in process_flair_assignment for {disp_submission_id}: {str(e)}", notify_discord=True)
 
-            # Fetch the comments of the submission
-            submission_comments = post.comments
-
-            # Nuke the comments
-            async for comment in submission_comments:
-                if not comment.removed and comment.distinguished != 'moderator':  # Check if the comment is not removed and not a moderator comment
-                    await comment.mod.remove()
-                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - removed comment {comment.id} under Post ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
-            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: - finished nuking comments under Post ID: {disp_submission_id} in {disp_subreddit_displayname}") if debugmode else None
-            mark_action_as_completed(submission_id, 'nukeUserComments')
+        #finally:
+        #    if is_submission_completed(submission_id):
+        #        delete_completed_actions(submission_id)
+        #        print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: All actions for submission {disp_submission_id} completed and deleted from the database") if debugmode else None
 
 
 
@@ -1485,6 +2052,7 @@ async def monitor_mod_log(reddit, bot_username, max_concurrency=1):
 
                                     if flair_details is not None:
                                         actions = []
+                                        flair_notes = flair_details.get('notes', 'No description')  # Get the notes, or 'No description' if not available
 
                                         if flair_details.get('approve', False):
                                             actions.append('approve')
@@ -1517,7 +2085,8 @@ async def monitor_mod_log(reddit, bot_username, max_concurrency=1):
 
                                         if actions:
                                             insert_actions_to_database(submission_id, actions, log_entry.mod.name, flair_guid)
-                                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Actions for flair GUID {disp_flair_guid} under submission {disp_submission_id} in {disp_subreddit_displayname} added to the database") if debugmode else None
+                                            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Actions for flair GUID {disp_flair_guid} ('{flair_notes}')") if debugmode else None
+                                            print(f"                         under submission {disp_submission_id} in {disp_subreddit_displayname} added to the database") if debugmode else None
                                         else:
                                             print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: No actions found for flair GUID {disp_flair_guid}") if debugmode else None
                                     else:
@@ -1535,11 +2104,11 @@ async def monitor_mod_log(reddit, bot_username, max_concurrency=1):
 
 
 
-async def process_flair_actions(reddit, max_concurrency=2):
+async def process_flair_actions(reddit, max_concurrency=2, processing_retry_delay=3, retry_delay=15):
     semaphore = asyncio.Semaphore(max_concurrency)
+    retry_tracker = defaultdict(lambda: {"attempts": 0, "last_attempt": None})
 
     async def process_flair_assignment_with_semaphore(submission_id, mod_name):
-
         if colored_console_output:
             disp_submission_id = colored(submission_id, "yellow")
         else:
@@ -1558,37 +2127,55 @@ async def process_flair_actions(reddit, max_concurrency=2):
                     delete_completed_actions(submission_id)
                     print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: All actions for submission {disp_submission_id} completed and deleted from the database") if debugmode else None
 
+                # Reset retry tracker on success
+                retry_tracker.pop(submission_id, None)
+
             except Exception as e:
                 print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Error processing actions for submission {disp_submission_id}: {str(e)}") if debugmode else None
-                # Handle the error appropriately (e.g., log, retry, or skip)
+
+                retry_tracker[submission_id]["attempts"] += 1
+                retry_tracker[submission_id]["last_attempt"] = datetime.utcnow()
+
+                if retry_tracker[submission_id]["attempts"] >= processing_retry_delay:
+                    await send_failure_notification(submission_id, mod_name, str(e))
+                    mark_all_actions_completed(submission_id)
+                    retry_tracker.pop(submission_id, None)
+                else:
+                    print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Retry {retry_tracker[submission_id]['attempts']} for submission {disp_submission_id}") if debugmode else None
 
     while True:
         pending_submission_ids = get_pending_submission_ids_from_database()
 
-        unique_submission_ids = set()
-        tasks = []
-        for submission_id, mod_name in pending_submission_ids:
-            if submission_id not in unique_submission_ids:
-                unique_submission_ids.add(submission_id)
+        if pending_submission_ids:
+            print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Found {len(pending_submission_ids)} pending submissions") if debugmode else None
 
+            tasks = []
+            for submission_id, mod_name in pending_submission_ids:
                 # Check if all actions for the submission are completed
                 if is_submission_completed(submission_id):
                     delete_completed_actions(submission_id)
                     print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: All actions for submission {submission_id} completed. Skipping processing.") if debugmode else None
                     continue
 
+                # Check if we need to wait before retrying
+                if submission_id in retry_tracker:
+                    last_attempt = retry_tracker[submission_id]["last_attempt"]
+                    if datetime.utcnow() - last_attempt < timedelta(seconds=retry_delay):
+                        continue
+
                 if colored_console_output:
                     disp_modname = colored(mod_name, "green", attrs=["underline", "bold"])
                 else:
                     disp_modname = mod_name
 
-                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Pending Action {submission_id} actioned by {disp_modname} found in database") if debugmode else None
+                print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Pending Actions on Submission {submission_id} actioned by {disp_modname} found in database") if debugmode else None
                 task = asyncio.create_task(process_flair_assignment_with_semaphore(submission_id, mod_name))
                 tasks.append(task)
 
-        await asyncio.gather(*tasks)
+            if tasks:
+                await asyncio.gather(*tasks)
 
-        await asyncio.sleep(1)  # Adjust the delay as needed
+        await asyncio.sleep(1)  # Always sleep for 1 second between checks
 
 
 
@@ -1612,6 +2199,17 @@ async def monitor_private_messages(reddit):
 
 
 
+async def start_process_flair_actions_task(reddit, max_concurrency, max_processing_retries, processing_retry_delay):
+    while True:
+        try:
+            await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Task] Flair Action Monitoring Started.")
+            await process_flair_actions(reddit, max_concurrency, max_processing_retries, processing_retry_delay)
+        except Exception as e:
+            #print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Modmail Task] Error in modmail task: {str(e)}\nWaiting 60 seconds before restarting monitor_modmail_stream") if debugmode else None
+            await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Task] Error in process_flair_actions task: {str(e)}\nWaiting 20 seconds before restarting monitor_modmail_stream")
+            await asyncio.sleep(20)
+            await add_task('Flair Helper - Process Flair Actions', start_task, start_process_flair_actions_task, reddit, max_concurrency, max_processing_retries, processing_retry_delay)
+            return
 
 
 async def start_monitor_mod_log_task(reddit, bot_username):
@@ -1623,20 +2221,9 @@ async def start_monitor_mod_log_task(reddit, bot_username):
             #print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Modqueue Task] Error in modqueue task: {str(e)}\nWaiting 60 seconds before restarting monitor_mod_queue") if debugmode else None
             await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Task] Error in monitor_mod_log task: {str(e)}\nWaiting 20 seconds before restarting monitor_mod_log")
             await asyncio.sleep(20)
-            await add_task('start_monitor_mod_log_task', start_task, start_monitor_mod_log_task, reddit, bot_username)
+            await add_task('Reddit - Monitor Mod Log', start_task, start_monitor_mod_log_task, reddit, bot_username)
             return
 
-async def start_process_flair_actions_task(reddit, max_concurrency=2):
-    while True:
-        try:
-            await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Task] Flair Action Monitoring Started.")
-            await process_flair_actions(reddit, max_concurrency)
-        except Exception as e:
-            #print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Modmail Task] Error in modmail task: {str(e)}\nWaiting 60 seconds before restarting monitor_modmail_stream") if debugmode else None
-            await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Task] Error in process_flair_actions task: {str(e)}\nWaiting 20 seconds before restarting monitor_modmail_stream")
-            await asyncio.sleep(20)
-            await add_task('start_process_flair_actions_task', start_task, start_process_flair_actions_task, reddit, max_concurrency)
-            return
 
 async def start_monitor_private_messages_task(reddit):
     while True:
@@ -1647,56 +2234,112 @@ async def start_monitor_private_messages_task(reddit):
             #print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Submission Task] Error in submission task: {str(e)}\nWaiting 60 seconds before restarting start_submission_task") if debugmode else None
             await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Task] Error in monitor_private_messages task: {str(e)}\nWaiting 20 seconds before restarting monitor_submission_stream")
             await asyncio.sleep(20)
-            await add_task('start_monitor_private_messages_task', start_task, start_monitor_private_messages_task, reddit)
+            await add_task('Reddit - Monitor Private Messages', start_task, start_monitor_private_messages_task, reddit)
             return
 
 
 
+async def robust_bot_polling(bot):
+    initial_retry_delay = 1
+    max_retry_delay = 60
+    retry_delay = initial_retry_delay
 
+    while True:
+        try:
+            print("Starting Telebot polling...") if debugmode or verbosemode else None
+            await telegram_bot.polling(non_stop=True, timeout=60)
+        except ApiTelegramException as e:
+            if e.error_code == 409:
+                print("Conflict error: Another instance of the bot is running.") if debugmode else None
+                await asyncio.sleep(10)
+            else:
+                print(f"ApiTelegramException: {e}") if debugmode else None
+                await asyncio.sleep(retry_delay)
+        except Exception as e:
+            print(f"Error in Telebot polling: {e}") if debugmode else None
+            await asyncio.sleep(retry_delay)
+
+        retry_delay = min(retry_delay * 2, max_retry_delay)
+        print(f"Restarting Telebot polling in {retry_delay} seconds...") if debugmode else None
 
 
 
 last_startup_time_main = None
 
-running_tasks = {}
+running_tasks: Dict[str, asyncio.Task] = {}
 
-task_semaphore = asyncio.Semaphore(3)  # Limit to 3 concurrent task restarts
-
-async def add_task(task_name, task_func, *args):
+async def add_task(task_name: str, task_func: Callable, *args: Any) -> None:
     global running_tasks
-    async with task_semaphore:
+
+    async def wrapped_task():
+        while True:
+            try:
+                await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [add_task Task Started] {task_name}")
+                await task_func(*args)
+            except Exception as e:
+                error_message = f"Error in {task_name}: {str(e)}"
+                await error_handler(error_message, notify_discord=True)
+                await asyncio.sleep(20)  # Wait before restarting
+            finally:
+                await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [add_task Task Stopped] {task_name} - Restarting...")
+
+    try:
         if task_name in running_tasks:
+            await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [add_task Task Cancelling] {task_name}")
             running_tasks[task_name].cancel()
-            await error_handler(f"[Task Management] Cancelling Task {task_name}", notify_discord=True)
-            await asyncio.sleep(2)  # Wait for a short duration to allow the task to be cancelled properly
-            await error_handler(f"[Task Management] Restarting Task {task_name}", notify_discord=True)
-        task = asyncio.create_task(task_func(*args))
+            try:
+                await running_tasks[task_name]
+            except asyncio.CancelledError:
+                pass
+            await asyncio.sleep(2)  # Wait for the task to be cancelled
+
+        task = asyncio.create_task(wrapped_task())
         running_tasks[task_name] = task
-        return task
+        await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [add_task Task Created] {task_name}")
+    except Exception as e:
+        await error_handler(f"Error in add_task for {task_name}: {str(e)}", notify_discord=True)
 
 
 
-async def start_task(task_func, *args):
-    initial_delay = 10  # Initial delay in seconds
-    max_delay = 160  # Max delay in seconds
+async def start_task(task_func, *args, task_name=None):
+    initial_delay = 10
+    max_delay = 160  # Assuming this was defined elsewhere
+    max_retries = 5
     delay = initial_delay
 
-    while True:
+    task_name = task_name or task_func.__name__
+
+    retries = 0
+    while retries < max_retries:
         try:
+            await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [start_task Started] {task_name}")
             await task_func(*args)
+            # Task completed successfully, break out of the loop
+            await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [start_task Task Completed] {task_name}")
+            break
         except Exception as e:
-            #print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [Start Task] Error in {task_func.__name__} task: {str(e)}\nRetrying in {delay} seconds...") if debugmode else None
-            await error_handler(f"[Start Task] Error in {task_func.__name__} task: {str(e)}\nRetrying in {delay} seconds...", notify_discord=True)
+            retries += 1
+            error_message = f"[start_task] Error in {task_name}: {str(e)}. Retry {retries}/{max_retries} in {delay} seconds..."
+            await error_handler(error_message, notify_discord=True)
             await asyncio.sleep(delay)
             delay = min(delay * 2, max_delay)  # Double the delay, capped at max_delay
-        else:
-            delay = initial_delay  # Reset the delay on successful execution
+        finally:
+            await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: [start_task Task Stopped] {task_name} - {'Restarting...' if retries < max_retries else 'Max retries reached.'}")
 
+    else:
+        # Max retries reached, handle the error
+        await error_handler(f"[start_task] Max retries reached for {task_name}. Exiting task.", notify_discord=True)
+
+    # Reset delay for next run
+    delay = initial_delay
+
+
+telegram_bot_id = None  # initialize as a global variable for Telegram telegram_bot_id
 
 
 @reddit_error_handler
 async def bot_main():
-    global running_tasks
+    global telegram_bot_id, running_tasks, reddit, bot_username, max_concurrency, max_processing_retries, processing_retry_delay
 
     if verbosemode:
         action_type = "[Initialization] "
@@ -1717,6 +2360,18 @@ async def bot_main():
 
     last_startup_time_main = current_time
 
+    '''
+    if config.telegram_bot_control:
+        try:
+            print("Connecting to Telegram servers...") if debugmode or verbosemode else None
+            telegram_bot_id = (await telegram_bot.get_me()).id
+            await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Successfully connected to Telegram servers. Bot ID: {telegram_bot_id}")
+            # Replace the old bot_polling_task with the new robust_bot_polling
+            await add_task('robust_bot_polling', start_task, robust_bot_polling, bot)
+        except Exception as e:
+            await error_handler(f"Critical error in bot_main: {str(e)}")
+            await asyncio.sleep(10)
+    '''
 
     print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Flair Helper 2 initializing asyncpraw") if debugmode else None
     reddit = asyncpraw.Reddit("fh2_login")
@@ -1733,25 +2388,41 @@ async def bot_main():
         print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Database is empty. Fetching and caching configurations for all moderated subreddits.") if verbosemode else None
         await fetch_and_cache_configs(reddit, bot_username)
 
-    max_concurrency = 2
     wiki_fetch_delay = 90
 
-    await add_task('start_monitor_mod_log_task', start_task, start_monitor_mod_log_task, reddit, bot_username)
-    await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: {action_type}Starting Monitor Mod Log...")
-
-    await add_task('start_process_flair_actions_task', start_task, start_process_flair_actions_task, reddit, max_concurrency)
-    await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: {action_type}Starting Process Flair Actions...")
-
-    await add_task('start_monitor_private_messages_task', start_task, start_monitor_private_messages_task, reddit)
-    await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: {action_type}Starting Monitor Private Messages...")
-
-    await delayed_fetch_and_cache_configs(reddit, bot_username, wiki_fetch_delay)
+    max_concurrency = 2
+    max_processing_retries = 3
+    processing_retry_delay = 15
 
     try:
+        if config.telegram_bot_control:
+            print("Connecting to Telegram servers...") if debugmode or verbosemode else None
+            telegram_bot_id = (await telegram_bot.get_me()).id
+            await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: Successfully connected to Telegram servers. Bot ID: {telegram_bot_id}")
+            # Replace the old bot_polling_task with the new robust_bot_polling
+            await add_task('Telegram - Bot Polling', start_task, robust_bot_polling, telegram_bot)
+
+        await add_task('Flair Helper - Process Flair Actions', start_task, start_process_flair_actions_task, reddit, max_concurrency, max_processing_retries, processing_retry_delay)
+        await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: {action_type}Starting Process Flair Actions...")
+
+        await add_task('Reddit - Monitor Mod Log', start_task, start_monitor_mod_log_task, reddit, bot_username)
+        await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: {action_type}Starting Monitor Mod Log...")
+
+        await add_task('Reddit - Monitor Private Messages', start_task, start_monitor_private_messages_task, reddit)
+        await discord_status_notification(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: {action_type}Starting Monitor Private Messages...")
+
+        await delayed_fetch_and_cache_configs(reddit, bot_username, wiki_fetch_delay)
+
         await asyncio.gather(*running_tasks.values())
     except asyncio.CancelledError:
         print(f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}: {action_type}Tasks cancelled") if debugmode else None
-
+    except Exception as e:
+        await error_handler(f"Critical error in bot_main: {str(e)}")
+        await asyncio.sleep(10)
+    finally:
+        for task in running_tasks.values():
+            task.cancel()
+        await asyncio.gather(*running_tasks.values(), return_exceptions=True)
 
 def main():
     loop = asyncio.get_event_loop()
